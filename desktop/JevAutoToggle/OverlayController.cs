@@ -9,6 +9,7 @@ internal sealed class OverlayController : IDisposable
     private readonly OverlayWindow _overlay = new();
     private readonly CodexUiTracker _tracker = new();
     private readonly RouterControlClient _router = new();
+    private readonly OverlayDiagnostics _diagnostics = new();
     private readonly DispatcherTimer _uiTimer;
     private readonly DispatcherTimer _statusTimer;
     private readonly CancellationTokenSource _cts = new();
@@ -16,6 +17,8 @@ internal sealed class OverlayController : IDisposable
     private AutoSnapshot _snapshot = new(false, false, "Connecting to Jev Router…", null, null);
     private bool _busy;
     private bool _statusInFlight;
+    private bool _anchorVisible;
+    private string? _lastAnchorLabel;
 
     public OverlayController(Dispatcher dispatcher)
     {
@@ -55,14 +58,20 @@ internal sealed class OverlayController : IDisposable
             anchor = null;
         }
 
-        if (anchor is null || !NativeWindowStyles.IsForegroundProcess(anchor.ProcessId))
+        if (anchor is null)
         {
+            _anchorVisible = false;
+            _lastAnchorLabel = null;
             _overlay.Hide();
+            _diagnostics.Write(false, null, _snapshot, "reasoning anchor not found in foreground window");
             return;
         }
 
+        _anchorVisible = true;
+        _lastAnchorLabel = anchor.Label;
         _overlay.SetAnchor(anchor);
         if (!_overlay.IsVisible) _overlay.Show();
+        _diagnostics.Write(true, _lastAnchorLabel, _snapshot);
     }
 
     private async Task RefreshStatusAsync()
@@ -87,6 +96,7 @@ internal sealed class OverlayController : IDisposable
         }
 
         _overlay.SetState(_snapshot, _busy);
+        _diagnostics.Write(_anchorVisible, _lastAnchorLabel, _snapshot);
     }
 
     private async void OnToggleRequested(object? sender, EventArgs e)
