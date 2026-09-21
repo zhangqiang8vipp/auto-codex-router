@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Jev Codex Router — local server on 127.0.0.1:4319 for the Codex Router.
 
 Receives Responses requests destined for the "jev/auto" model (the Codex
@@ -55,6 +55,7 @@ carried across the generic-provider hop as a non-retryable Responses failure;
 Jev never substitutes a third-party model.
 """
 import codecs
+import contextlib
 import hashlib
 import http.client
 import json
@@ -377,6 +378,63 @@ def quota_failure_sse(error):
         + json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         + "\n\n"
     ).encode("utf-8")
+
+
+# The host's native redirect is deliberately all-or-nothing: it reroutes every
+# native turn (including the concrete tier this router just selected) back to
+# jev/auto, which would otherwise recurse Python -> Node -> Python forever and
+# flood the upstream. Serialize routed turns and move the redirect state file
+# aside only while concrete tiers are being served, then restore it.
+_NATIVE_REDIRECT_LOCK = threading.Lock()
+_NATIVE_REDIRECT_NAME = "native-redirect.json"
+_NATIVE_REDIRECT_HELD_NAME = "native-redirect.json.routing-held"
+
+
+_NATIVE_REDIRECT_DEPTH = 0
+_NATIVE_REDIRECT_CAPTURED = None
+
+
+@contextlib.contextmanager
+def native_redirect_suppressed():
+    """Move native-redirect.json aside for the duration of a forward.
+
+    Reference counted and the lock only brackets file operations, so overlapping
+    turns never restore the redirect while another concrete forward is in flight
+    and a slow upstream wait does not serialize every request on the lock.
+    """
+    global _NATIVE_REDIRECT_DEPTH, _NATIVE_REDIRECT_CAPTURED
+    path = os.path.join(STATE, _NATIVE_REDIRECT_NAME)
+    held = os.path.join(STATE, _NATIVE_REDIRECT_HELD_NAME)
+    with _NATIVE_REDIRECT_LOCK:
+        if _NATIVE_REDIRECT_DEPTH == 0:
+            _NATIVE_REDIRECT_CAPTURED = None
+            try:
+                if os.path.exists(path):
+                    with open(path, encoding="utf-8") as fh:
+                        _NATIVE_REDIRECT_CAPTURED = fh.read()
+                    os.replace(path, held)
+            except OSError:
+                _NATIVE_REDIRECT_CAPTURED = None
+        _NATIVE_REDIRECT_DEPTH += 1
+    try:
+        yield
+    finally:
+        with _NATIVE_REDIRECT_LOCK:
+            _NATIVE_REDIRECT_DEPTH -= 1
+            if _NATIVE_REDIRECT_DEPTH == 0:
+                try:
+                    if _NATIVE_REDIRECT_CAPTURED is not None and not os.path.exists(path):
+                        with open(path, "w", encoding="utf-8") as fh:
+                            fh.write(_NATIVE_REDIRECT_CAPTURED)
+                        try:
+                            os.chmod(path, 0o600)
+                        except OSError:
+                            pass
+                    if os.path.exists(held):
+                        os.remove(held)
+                except OSError:
+                    pass
+                _NATIVE_REDIRECT_CAPTURED = None
 
 
 def key_paths():
@@ -1264,6 +1322,11 @@ class Handler(BaseHTTPRequestHandler):
         # Our own answer signatures never travel back upstream (see
         # strip_signatures): the model must not read its own route tag.
         stripped = strip_signatures(payload)
+        try:
+            with open(os.path.join(STATE, "inbound-trace.log"), "a", encoding="utf-8") as _tf:
+                _tf.write(time.strftime("%%H:%%M:%%S") + " path=" + path + " model=" + str(payload.get("model")) + "\n")
+        except OSError:
+            pass
 
         t0 = time.time()
         debug = os.path.exists(DEBUG_PATH)
@@ -1404,14 +1467,15 @@ class Handler(BaseHTTPRequestHandler):
             # tiers are exhausted.
             while True:
                 apply_route(payload, attempt_model, attempt_effort)
-                try:
-                    status, out_kind, ctype, _q, _u, _r, error_bytes = self._forward(
-                        payload, out_path, stream_requested, debug, marker,
-                        attempt_model, signature)
-                except (http.client.HTTPException, ConnectionError, OSError) as exc:
-                    status = 502
-                    error_bytes = json.dumps({"error": {"type": "server_error",
-                        "message": f"router connection failed: {exc}"}}).encode("utf-8")
+                with native_redirect_suppressed():
+                    try:
+                        status, out_kind, ctype, _q, _u, _r, error_bytes = self._forward(
+                            payload, out_path, stream_requested, debug, marker,
+                            attempt_model, signature)
+                    except (http.client.HTTPException, ConnectionError, OSError) as exc:
+                        status = 502
+                        error_bytes = json.dumps({"error": {"type": "server_error",
+                            "message": f"router connection failed: {exc}"}}).encode("utf-8")
                 breaker_record(attempt_model, status == 200)
                 if status == 200:
                     break
@@ -1431,8 +1495,9 @@ class Handler(BaseHTTPRequestHandler):
                 gate = f"{gate}+escalated"
         else:
             apply_route(payload, model, effort)
-            status, out_kind, ctype, _q, _u, _r, error_bytes = self._forward(
-                payload, out_path, stream_requested, debug, marker, model, signature)
+            with native_redirect_suppressed():
+                status, out_kind, ctype, _q, _u, _r, error_bytes = self._forward(
+                    payload, out_path, stream_requested, debug, marker, model, signature)
             breaker_record(model, status == 200)
 
         retried = False
