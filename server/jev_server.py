@@ -12,12 +12,12 @@ Every pair uses standard speed. Confidence is logged without changing the chosen
 model. There are no keyword/scenario overrides or target model proportions.
 Technical Jev failures remain fail-open to astra @medium and are logged separately.
 
-Per-call awareness (v2): every request is classified as a fresh user turn, a
-tool-step continuation, or other. Tool-steps carry a digest of the last tool
-output and its tool name into the Jev state, so Jev routes THIS step
-(mechanical continuation, standard next action, or frontier-worthy) instead
-of re-judging the session's original prompt. On live sessions (7 days):
-~92% of model calls are tool-steps — ~74% of the money weight.
+Session-aware routing (v4): every request is classified as a meaningful user
+turn, tool-step continuation, or other, but classification no longer implies a
+new Jev judgement. A meaningful user turn establishes a model/effort Route
+Lease. Tool loops, background calls and compaction continuations KEEP that
+lease; repeated tool failures raise it locally. Jev is consulted again only
+when a valid lease is missing or a meaningful user turn opens a new boundary.
 
 Input handling (v3): Jev sees the current ask, never the thread — the task is
 Codex's last user text, with Codex's own machine-generated envelopes stripped
@@ -68,11 +68,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from auto_control import set_enabled as set_auto_enabled
 from auto_control import status as auto_status
+from route_lease import (RouteLeaseLocks, apply_failure_escalation,
+                         contains_compaction, failure_state, human_turn_key,
+                         lease_fields, read_lease, route_action,
+                         served_continuity_fields, tool_step_key)
 from routing_policy import (ASTRA, EFFORTS, LUNA, POLICY_VERSION, QUESTIONS, SOL,
                             TERRA, TIERS, decision_from_answers, route)
 from smart_context import (RepoProfiler, SessionStore, apply_guardrails,
-                           enrich_jev_state, extract_cwd, next_failure_streak,
-                           session_key)
+                           enrich_jev_state, extract_cwd, session_key)
 from shadow_eval import (append_event as append_shadow_event,
                          build_tool_feedback, build_turn_event, new_turn_id)
 
@@ -95,6 +98,7 @@ LOG_PATH = os.path.join(STATE, "jev-router-live.jsonl")
 SHADOW_EVAL_PATH = os.path.join(STATE, "jev-shadow-eval.jsonl")
 SESSION_PATH = os.path.join(STATE, "jev-router-sessions.json")
 SESSION_STORE = SessionStore(SESSION_PATH)
+ROUTE_LEASE_LOCKS = RouteLeaseLocks()
 REPO_PROFILER = RepoProfiler()
 
 def _port_from_env(*names, default):
@@ -116,7 +120,7 @@ ROUTER = ("127.0.0.1", _port_from_env(
     "MODEL_ROUTER_PORT", "CODEX_ROUTER_PORT", default=4202))
 
 DISPLAY_NAME = "Jev Codex Router"
-VERSION = "1.7"
+VERSION = "1.8"
 VIRTUAL_MODEL_ID = "auto"
 VIRTUAL_MODEL_SLUG = "jev/auto"
 VIRTUAL_CONTEXT_WINDOW = 1_050_000
@@ -1546,26 +1550,20 @@ class Handler(BaseHTTPRequestHandler):
         task, prev_assistant, signals = extract(payload)
         step = classify(payload)
         cwd = extract_cwd(payload)
-        thread_key = session_key(payload, cwd)
+        thread_key = session_key(payload, cwd, self.headers)
         session = SESSION_STORE.get(thread_key)
-        failure_streak = next_failure_streak(session, step)
         repo = REPO_PROFILER.snapshot(cwd)
         stream_requested = payload.get("stream") is True
         turn_id = new_turn_id()
         session_tag = thread_key[:16] if thread_key else None
-        previous_eval_id = session.get("last_eval_id")
-        if (step.get("step_type") == "tool_step"
-                and isinstance(previous_eval_id, str) and previous_eval_id):
-            append_shadow_event(
-                SHADOW_EVAL_PATH,
-                build_tool_feedback(
-                    at=time.strftime("%Y-%m-%dT%H:%M:%S"),
-                    turn_id=previous_eval_id,
-                    session=session_tag,
-                    errored=bool(step.get("errored")),
-                ),
-            )
-
+        turn_key = human_turn_key(payload, task=task, session_key=thread_key)
+        active_turn_key = turn_key
+        tool_key = tool_step_key(payload, digest=step.get("digest") or "", session_key=thread_key)
+        compacted = contains_compaction(payload)
+        meaningful_user_turn = (
+            step.get("step_type") == "user_turn"
+            and (bool(task) or bool(signals.get("has_image")))
+        )
         tier = depth = conf = None
         jev_ms = None
         jev_cache = None
@@ -1573,52 +1571,150 @@ class Handler(BaseHTTPRequestHandler):
         jev_usage = None
         smart_gate = None
         breaker_blocked = False
-        if os.path.exists(OFF_PATH):
-            model, effort, speed, gate = ASTRA, None, "default", "off"
-        else:
-            key = load_key()
-            if key and (task or step.get("digest") or signals.get("has_image")):
-                jt0 = time.time()
-                state = jev_state(task, prev_assistant, signals, step)
-                state = enrich_jev_state(state, task, session, repo, failure_streak)
-                try:
-                    result, jev_cache = call_jev_for_route(key, state, raw)
-                    decision = decision_from_answers(result.get("answers"))
-                    raw_usage = result.get("usage") or {}
-                    if not isinstance(raw_usage, dict):
-                        raw_usage = {}
-                    jev_usage = (
-                        {k: v for k, v in raw_usage.items()
-                         if k in ("input_tokens", "output_tokens", "inputTokens", "outputTokens")
-                         and isinstance(v, int) and not isinstance(v, bool) and v >= 0}
-                        if jev_cache == "miss" else None
+        route_source = None
+        lease_action = None
+        lease_reason = None
+        tool_replay = False
+        lease_synced_to_served = False
+
+        # Serialize only semantic route selection for this session. The lock is
+        # released before the actual model call, so unrelated sessions and the
+        # long upstream stream remain fully concurrent.
+        with ROUTE_LEASE_LOCKS.hold(thread_key):
+            # Another concurrent replay may have created the lease while this
+            # request waited for the per-session decision lock.
+            session = SESSION_STORE.get(thread_key)
+            failure_streak, tool_replay, continuity_fields = failure_state(
+                session,
+                step_type=step.get("step_type") or "other",
+                errored=bool(step.get("errored")),
+                tool_key=tool_key,
+            )
+            lease = read_lease(session, POLICY_VERSION)
+
+            # Feedback and failure state are event-based, not transport-replay
+            # based. An identical replay must not count the same failed tool
+            # result twice or emit duplicate feedback.
+            previous_eval_id = session.get("last_eval_id")
+            if (step.get("step_type") == "tool_step"
+                    and not tool_replay
+                    and isinstance(previous_eval_id, str) and previous_eval_id):
+                append_shadow_event(
+                    SHADOW_EVAL_PATH,
+                    build_tool_feedback(
+                        at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        turn_id=previous_eval_id,
+                        session=session_tag,
+                        errored=bool(step.get("errored")),
+                    ),
+                )
+
+            lease_action, lease_reason = route_action(
+                step_type=step.get("step_type") or "other",
+                meaningful_user_turn=meaningful_user_turn,
+                turn_key=turn_key,
+                lease=lease,
+                compacted=compacted,
+            )
+
+            if os.path.exists(OFF_PATH):
+                model, effort, speed, gate = ASTRA, None, "default", "off"
+                route_source = "off"
+                if thread_key:
+                    SESSION_STORE.put(thread_key, failure_streak=failure_streak)
+            elif lease_action == "KEEP" and lease is not None:
+                active_turn_key = lease.turn_key or turn_key
+                model, effort, speed = lease.model, lease.effort, "default"
+                model, effort, local_escalation = apply_failure_escalation(
+                    model, effort, failure_streak
+                )
+                route_source = "lease_escalation" if local_escalation else "lease"
+                smart_gate = local_escalation or "lease_keep"
+                gate = f"lease:{lease_reason}"
+                if local_escalation:
+                    gate = f"{gate}+{local_escalation}"
+
+                if thread_key:
+                    SESSION_STORE.put(
+                        thread_key,
+                        failure_streak=failure_streak,
+                        last_model=model,
+                        last_effort=effort,
+                        **lease_fields(
+                            model,
+                            effort,
+                            turn_key=active_turn_key,
+                            source=("local_escalation" if local_escalation else lease.source),
+                            policy_version=POLICY_VERSION,
+                        ),
                     )
-                    tier, depth, conf = (decision["model"], decision["effort"],
-                                         decision["confidence"])
-                    model, effort, speed, gate = route(tier, depth)
-                    model, effort, smart_gate = apply_guardrails(
-                        model, effort, task, step, session, failure_streak)
-                    if smart_gate != "apply":
-                        gate = f"{gate}+{smart_gate}"
-                except Exception as exc:
-                    model, effort, speed, gate = ASTRA, "medium", "default", f"jev_error:{type(exc).__name__}"
-                jev_ms = int((time.time() - jt0) * 1000)
             else:
-                model, effort, speed, gate = ASTRA, "medium", "default", "no_key_or_task"
+                key = load_key()
+                if key and (task or step.get("digest") or signals.get("has_image")):
+                    jt0 = time.time()
+                    state = jev_state(task, prev_assistant, signals, step)
+                    state = enrich_jev_state(state, task, session, repo, failure_streak)
+                    try:
+                        result, jev_cache = call_jev_for_route(key, state, raw)
+                        decision = decision_from_answers(result.get("answers"))
+                        raw_usage = result.get("usage") or {}
+                        if not isinstance(raw_usage, dict):
+                            raw_usage = {}
+                        jev_usage = (
+                            {k: v for k, v in raw_usage.items()
+                             if k in ("input_tokens", "output_tokens", "inputTokens", "outputTokens")
+                             and isinstance(v, int) and not isinstance(v, bool) and v >= 0}
+                            if jev_cache == "miss" else None
+                        )
+                        tier, depth, conf = (decision["model"], decision["effort"],
+                                             decision["confidence"])
+                        model, effort, speed, gate = route(tier, depth)
+                        model, effort, smart_gate = apply_guardrails(
+                            model, effort, task, step, session, failure_streak)
+                        if smart_gate != "apply":
+                            gate = f"{gate}+{smart_gate}"
+                        route_source = "jev"
+                    except Exception as exc:
+                        model, effort, speed, gate = (
+                            ASTRA, "medium", "default",
+                            f"jev_error:{type(exc).__name__}"
+                        )
+                        route_source = "jev_error_fallback"
+                    jev_ms = int((time.time() - jt0) * 1000)
+                else:
+                    model, effort, speed, gate = ASTRA, "medium", "default", "no_key_or_task"
+                    route_source = "fallback"
+
+                # Even a technical fallback becomes the continuity route for
+                # this user turn. Otherwise every tool result after one Jev
+                # outage would ask Jev again or accidentally resurrect the
+                # previous task's lease.
+                if thread_key and model in TIERS and effort in EFFORTS:
+                    SESSION_STORE.put(
+                        thread_key,
+                        failure_streak=failure_streak,
+                        last_model=model,
+                        last_effort=effort,
+                        **lease_fields(
+                            model,
+                            effort,
+                            turn_key=turn_key,
+                            source=route_source,
+                            policy_version=POLICY_VERSION,
+                        ),
+                    )
+                elif thread_key:
+                    SESSION_STORE.put(thread_key, failure_streak=failure_streak)
+
+            if thread_key:
+                SESSION_STORE.put(thread_key, **continuity_fields)
 
         # Capture the production smart route before operational shadow/dry
-        # overrides. The raw Jev route remains tier/depth above.
+        # overrides. The raw Jev route is populated only when this request
+        # actually opened a semantic Jev decision.
         smart_model, smart_effort, smart_speed, smart_route_gate = (
             model, effort, speed, gate
         )
-
-        # Remember only bounded routing state. Operational fail-open paths do
-        # not overwrite the last healthy semantic route.
-        if thread_key:
-            remembered = {"failure_streak": failure_streak}
-            if decision is not None and model in TIERS:
-                remembered.update(last_model=model, last_effort=effort)
-            SESSION_STORE.put(thread_key, **remembered)
 
         would = None
         if os.path.exists(SHADOW_PATH):
@@ -1779,6 +1875,33 @@ class Handler(BaseHTTPRequestHandler):
         )
         if request_completed:
             invalidate_route_cache(raw)
+
+            # Tool-result continuity should follow the physical native model
+            # that actually completed the previous call. If a breaker or
+            # retry escalated Sol -> Astra, keep Astra for the rest of this
+            # human turn without asking Jev again. Guard the write with the
+            # semantic lock and turn key so a slow old turn cannot overwrite
+            # a newer user's route lease.
+            if (thread_key and model in TIERS and effort in EFFORTS
+                    and not os.path.exists(SHADOW_PATH)):
+                with ROUTE_LEASE_LOCKS.hold(thread_key):
+                    latest_session = SESSION_STORE.get(thread_key)
+                    latest_lease = read_lease(latest_session, POLICY_VERSION)
+                    served_fields = served_continuity_fields(
+                        latest_lease,
+                        served_model=model,
+                        served_effort=effort,
+                        turn_key=active_turn_key,
+                        policy_version=POLICY_VERSION,
+                    )
+                    if served_fields is not None:
+                        SESSION_STORE.put(
+                            thread_key,
+                            last_model=model,
+                            last_effort=effort,
+                            **served_fields,
+                        )
+                        lease_synced_to_served = True
         total_ms = int((time.time() - t0) * 1000)
         finished_at = time.strftime("%Y-%m-%dT%H:%M:%S")
         log_line({
@@ -1788,6 +1911,13 @@ class Handler(BaseHTTPRequestHandler):
             "chosen_probability": decision["chosen_probability"] if decision else None,
             "jev_usage": jev_usage,
             "jev_cache": jev_cache,
+            "route_source": route_source,
+            "lease_action": lease_action,
+            "lease_reason": lease_reason,
+            "tool_replay": tool_replay,
+            "lease_synced_to_served": lease_synced_to_served,
+            "compacted": compacted,
+            "turn": active_turn_key[:10] if active_turn_key else None,
             "attempts": self._attempts,
             "gate": gate,
             "tier": tier,
@@ -1839,6 +1969,9 @@ class Handler(BaseHTTPRequestHandler):
                 total_ms=total_ms,
                 jev_ms=jev_ms,
                 step_type=step["step_type"],
+                route_source=route_source,
+                route_reason=lease_reason,
+                jev_cache=jev_cache,
                 dry_reason=dry_reason,
                 fallback=fallback,
             ),
