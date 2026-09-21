@@ -1,6 +1,6 @@
 # Jev Codex Router
 
-[![ci](https://github.com/0xNatoshi/jev-codex-router/actions/workflows/ci.yml/badge.svg)](https://github.com/0xNatoshi/jev-codex-router/actions/workflows/ci.yml)
+[![ci](https://github.com/zhangqiang8vipp/jev-codex-router/actions/workflows/ci.yml/badge.svg)](https://github.com/zhangqiang8vipp/jev-codex-router/actions/workflows/ci.yml)
 
 **Per-turn model routing for Codex, driven by [Jev](https://docs.typesafe.ai) (TypeSafe System One).**
 
@@ -17,11 +17,14 @@ This is not a fork of any router: it plugs into an existing local
 **Codex Router** installation through its official extension points
 (a *generic provider* + a *curated model*), so router updates never overwrite it.
 
+**Fork it. Change the policy. Keep your own tandem.** MIT. No permission needed.
+See [Fork and customize](#fork-and-customize--允许自己改) below.
+
 ## How it works
 
 ```
 Codex ──▶ Codex Router (:4202)
-            ├─ native models ──────────────▶ ChatGPT backend (your plan)
+            ├─ native models ─────────────▶ ChatGPT backend (your plan)
             └─ "jev/auto" ─▶ LiteLLM ─▶ API forwarder
                                      │
                                      ▼
@@ -308,6 +311,28 @@ curl -s http://127.0.0.1:4319/health
 
 Early, but running in production on the author's setup. The joint routing policy needs outcome calibration on real usage; the local
 decision and attempt logs provide observations, not quality labels.
+
+## Fork and customize / 允许自己改
+
+This tree is MIT. Fork it, strip it, or replace the policy. You do not need to
+ask. Keep the original copyright notice in copies of the Software.
+
+Suggested local edit points (edit source, never generated artifacts):
+
+| Want | File |
+|---|---|
+| Change which model + effort Jev may pick | `server/routing_policy.py` — `TIERS`, `EFFORTS`, `MODEL_PROFILES`, `QUESTIONS` |
+| Bump the logged policy id after a real change | `POLICY_VERSION` in the same file |
+| Swap Codex-dry substitutes / effort mapping | tandem tables inside `server/jev_server.py` |
+| Change fail-open, kill switch, or shadow behavior | sentinels documented in Operations |
+| Recalibrate after you change the contract | `python3 server/report_routing.py --days 7` on your own `jev-router-live.jsonl` |
+
+Do not reuse a replay cache built under another `POLICY_VERSION`. A valid Jev
+choice is applied as-is; if you add keyword rules or a preferred-model bias,
+that is your fork, not this policy.
+
+Upstream origin: [0xNatoshi/jev-codex-router](https://github.com/0xNatoshi/jev-codex-router).
+PRs back here are welcome; a private fork with a different tandem is also fine.
 
 ## License
 
