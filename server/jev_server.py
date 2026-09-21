@@ -146,7 +146,9 @@ MODEL_CATALOG_MAX_BYTES = 16 * 1024 * 1024
 # paying TypeSafe again for every transport retry is waste. Cache only successful
 # routing judgements, keyed by a digest of the original request bytes (never the
 # request content itself), and coalesce concurrent identical calls.
-ROUTE_CACHE_TTL_S = 45.0
+# A judgement for an unanswered request stays cached until the request
+# succeeds; this is only a safety cap to prevent unbounded growth.
+ROUTE_CACHE_SAFETY_TTL_S = 600.0
 ROUTE_CACHE_MAX_ENTRIES = 256
 ROUTE_SINGLEFLIGHT_WAIT_S = 8.0
 
@@ -296,7 +298,7 @@ def call_jev_for_route(key, state, request_bytes, timeout=4.0):
         result = call_jev_routed(key, state, timeout=timeout)
         flight.result = result
         with _route_cache_lock:
-            _route_cache[cache_key] = (time.monotonic() + ROUTE_CACHE_TTL_S, result)
+            _route_cache[cache_key] = (time.monotonic() + ROUTE_CACHE_SAFETY_TTL_S, result)
             _purge_route_cache(time.monotonic())
         return result, "miss"
     except Exception as exc:
@@ -306,6 +308,13 @@ def call_jev_for_route(key, state, request_bytes, timeout=4.0):
         with _route_cache_lock:
             _route_flights.pop(cache_key, None)
         flight.event.set()
+
+
+def invalidate_route_cache(request_bytes):
+    """Drop the cached judgement once the request has a successful response."""
+    key = _route_cache_key(request_bytes)
+    with _route_cache_lock:
+        _route_cache.pop(key, None)
 
 
 def _error_object(data):
@@ -421,6 +430,58 @@ def call_jev(key, state, questions=None, timeout=4.0):
 def call_jev_routed(key, state, questions=None, timeout=4.0):
     """One System One call, on the direct TypeSafe API."""
     return call_jev(key, state, questions, timeout=timeout)
+
+# ---------------------------------------------------------------------------
+# Circuit breaker: track per-model upstream failures so a rate-limited model
+# stops being selected for a cooldown window instead of hammering it.
+# ---------------------------------------------------------------------------
+_BREAKER = {}            # model -> (fail_count, first_fail_ts, open_until)
+_BREAKER_THRESHOLD = 2   # consecutive failures before opening
+_BREAKER_OPEN_S = 60.0   # how long a model is skipped
+_BREAKER_HALF_S = 30.0   # half-open probe window
+
+def breaker_record(model, ok):
+    """Record upstream result. Returns True if model is currently available."""
+    now = time.time()
+    entry = _BREAKER.get(model)
+    if ok:
+        if entry:
+            _BREAKER.pop(model, None)
+        return True
+    if entry is None:
+        _BREAKER[model] = (1, now, 0.0)
+        return True
+    count, first_ts, open_until = entry
+    count += 1
+    if count >= _BREAKER_THRESHOLD and open_until == 0.0:
+        open_until = now + _BREAKER_OPEN_S
+    _BREAKER[model] = (count, first_ts, open_until)
+    return open_until == 0.0 or now >= open_until
+
+def breaker_available(model):
+    """Check if a model is available (not in open circuit state)."""
+    entry = _BREAKER.get(model)
+    if entry is None:
+        return True
+    count, first_ts, open_until = entry
+    now = time.time()
+    if open_until == 0.0:
+        return True
+    # Half-open: allow one probe after the cooldown
+    if now >= open_until + _BREAKER_HALF_S:
+        _BREAKER[model] = (0, now, 0.0)  # reset to allow probe
+        return True
+    return now >= open_until
+
+def breaker_pick(preferred_model):
+    """If preferred model is open, pick the next available tier upward."""
+    if breaker_available(preferred_model):
+        return preferred_model, False
+    idx = TIERS.index(preferred_model) if preferred_model in TIERS else 0
+    for candidate in list(TIERS[idx+1:]) + list(TIERS[:idx]):
+        if breaker_available(candidate):
+            return candidate, True
+    return preferred_model, False  # all open; let it try anyway
 
 
 def validate_ask(body):
@@ -1268,6 +1329,12 @@ class Handler(BaseHTTPRequestHandler):
                     model, effort, speed, gate = route(tier, depth)
                     model, effort, smart_gate = apply_guardrails(
                         model, effort, task, step, session, failure_streak)
+                    # Circuit breaker: skip an open model upward without another
+                    # paid Jev judgement.
+                    alt_model, breaker_rerouted = breaker_pick(model)
+                    if breaker_rerouted:
+                        model = alt_model
+                        smart_gate = (smart_gate + "+" if smart_gate != "apply" else "") + "breaker"
                     if smart_gate != "apply":
                         gate = f"{gate}+{smart_gate}"
                 except Exception as exc:
@@ -1319,17 +1386,64 @@ class Handler(BaseHTTPRequestHandler):
             payload["stream"] = True  # the local caller edge requires streaming
             return payload
 
-        apply_route(payload, model, effort)
-
         out_path = path if path.startswith("/v1") else "/v1" + path
         self._attempts = []
-        status, out_kind, ctype, _quota_hit, _unwritten, _resets_at = self._forward(
-            payload, out_path, stream_requested, debug, marker, model, signature)
+        RETRYABLE_UPSTREAM = {429, 500, 502, 503, 504}
+        # Bound total time spent escalating across tiers (seconds since request start).
+        ESCALATION_DEADLINE = 75.0
+        attempt_model = model
+        attempt_effort = effort
+        status = 0
+        out_kind = ctype = ""
+        error_bytes = None
+        escalated = False
+
+        if stream_requested:
+            # Tier-escalation loop: a failed model bumps up one tier and is
+            # retried WITHOUT another Jev decision, until success or all
+            # tiers are exhausted.
+            while True:
+                apply_route(payload, attempt_model, attempt_effort)
+                try:
+                    status, out_kind, ctype, _q, _u, _r, error_bytes = self._forward(
+                        payload, out_path, stream_requested, debug, marker,
+                        attempt_model, signature)
+                except (http.client.HTTPException, ConnectionError, OSError) as exc:
+                    status = 502
+                    error_bytes = json.dumps({"error": {"type": "server_error",
+                        "message": f"router connection failed: {exc}"}}).encode("utf-8")
+                breaker_record(attempt_model, status == 200)
+                if status == 200:
+                    break
+                idx = TIERS.index(attempt_model) if attempt_model in TIERS else -1
+                if (status in RETRYABLE_UPSTREAM and idx + 1 < len(TIERS)
+                        and time.time() - t0 < ESCALATION_DEADLINE):
+                    attempt_model = TIERS[idx + 1]
+                    escalated = True
+                    continue
+                break
+            model = attempt_model
+            effort = attempt_effort
+            # All tiers failed: write the final error response now.
+            if status != 200 and error_bytes is not None:
+                self._write_error_response(status, error_bytes)
+            if escalated and status == 200:
+                gate = f"{gate}+escalated"
+        else:
+            apply_route(payload, model, effort)
+            status, out_kind, ctype, _q, _u, _r, error_bytes = self._forward(
+                payload, out_path, stream_requested, debug, marker, model, signature)
+            breaker_record(model, status == 200)
+
         retried = False
         fallback = None
 
-        finished_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+        # Once the request has succeeded, its cached decision is no longer
+        # needed: clear it so the next message makes a fresh Jev call.
+        if status == 200:
+            invalidate_route_cache(raw)
         total_ms = int((time.time() - t0) * 1000)
+        finished_at = time.strftime("%Y-%m-%dT%H:%M:%S")
         log_line({
             "at": finished_at,
             "policy_version": POLICY_VERSION,
@@ -1395,16 +1509,24 @@ class Handler(BaseHTTPRequestHandler):
         if thread_key:
             SESSION_STORE.put(thread_key, last_eval_id=turn_id)
 
+    def _write_error_response(self, status, error_bytes):
+        """Write a terminal JSON error for a streaming request that never got a stream."""
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(error_bytes)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(error_bytes)
+
     def _forward(self, payload, out_path, stream_requested, debug, marker, model, signature=None):
         """One relay attempt to the local caller edge, streamed straight back.
-
         Returns (status, out_kind, ctype, quota_hit, unwritten, resets_at).
         The last three fields are retained as false/None placeholders for call
         site and logging compatibility. This OpenAI-only router never retries a
         quota failure on a third-party model.
         """
         body = json.dumps(payload).encode("utf-8")
-        conn = http.client.HTTPConnection(*ROUTER, timeout=900)
+        conn = http.client.HTTPConnection(*ROUTER, timeout=30)
         status = 0
         out_kind = ""
         ctype = ""
@@ -1413,6 +1535,8 @@ class Handler(BaseHTTPRequestHandler):
                    "terminal_type": None, "usage": None}
         self._attempts.append(attempt)
         markerer = None
+        status = 0
+        error_bytes = None
         try:
             conn.request(
                 "POST",
@@ -1421,6 +1545,11 @@ class Handler(BaseHTTPRequestHandler):
                 headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
             )
             resp = conn.getresponse()
+            # Headers arrived: allow a longer window for the streamed body
+            # (legitimately long generations), while a fully-dead read still
+            # fails after 120s instead of hanging the slot for 300s+.
+            if conn.sock is not None:
+                conn.sock.settimeout(120)
             status = resp.status
             ctype = (resp.getheader("Content-Type") or "").strip()
             # The local caller edge sets NO Content-Type on SSE streams. For a
@@ -1488,12 +1617,10 @@ class Handler(BaseHTTPRequestHandler):
                         out_ctype = "application/json"
                 quota_error = terminal_quota_error(status, resp.headers, data)
                 if quota_error is not None and stream_requested:
-                    # Do not expose terminal ChatGPT quota as HTTP 429 through
-                    # the generic Jev provider. The outer Router would rewrite
-                    # that provider error and Codex would exhaust its HTTP retry
-                    # budget before seeing the subscription semantics. A 200 SSE
-                    # response.failed survives the generic provider hop, and
-                    # Codex treats insufficient_quota as terminal.
+                    # Terminal ChatGPT subscription/quota exhaustion: return a
+                    # 200 SSE response.failed so Codex shows the native
+                    # usage-limit message and treats it as terminal rather than
+                    # burning its HTTP retry budget through the generic provider.
                     out_kind = "sse"
                     stream = quota_failure_sse(quota_error)
                     self.send_response(200)
@@ -1502,15 +1629,33 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("Connection", "close")
                     self.end_headers()
                     self.wfile.write(stream)
+                    # Already handled as a terminal 200; do not escalate.
+                    status = 200
+                    error_bytes = None
                 else:
-                    # Ordinary rate-limit 429s remain 429s. They are genuinely
-                    # retryable and must not be mislabeled as exhausted usage.
-                    self.send_response(status)
-                    self.send_header("Content-Type", out_ctype)
-                    self.send_header("Content-Length", str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
-            return status, out_kind, ctype, False, None, None
+                    error_bytes = None
+                    if status != 200 and stream_requested:
+                        # Transient upstream error: build an OpenAI-format error
+                        # but do NOT write it; the caller escalates a tier.
+                        out_kind = "error"
+                        try:
+                            parsed = json.loads(data.decode("utf-8", "replace"))
+                            inner = parsed.get("error", parsed) if isinstance(parsed, dict) else {}
+                        except (ValueError, UnicodeDecodeError):
+                            inner = {}
+                        if status == 429:
+                            inner["type"] = "rate_limit_error"
+                            inner["code"] = "rate_limit_exceeded"
+                            inner.setdefault("message", "You have hit your rate limit. Check your workspace usage settings to continue.")
+                        error_bytes = json.dumps({"error": inner}).encode("utf-8")
+                    else:
+                        # Ordinary non-stream / success: write straight through.
+                        self.send_response(status)
+                        self.send_header("Content-Type", out_ctype)
+                        self.send_header("Content-Length", str(len(data)))
+                        self.end_headers()
+                        self.wfile.write(data)
+            return status, out_kind, ctype, False, None, None, error_bytes
         finally:
             attempt["status"] = status
             if markerer is not None:
