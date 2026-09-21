@@ -55,6 +55,7 @@ the caller as-is; Jev never substitutes a third-party model.
 """
 import codecs
 import http.client
+import hashlib
 import json
 import os
 import re
@@ -250,6 +251,89 @@ def call_jev(key, state, questions=None, timeout=4.0):
 def call_jev_routed(key, state, questions=None, timeout=4.0):
     """One System One call, on the direct TypeSafe API."""
     return call_jev(key, state, questions, timeout=timeout)
+
+# ---------------------------------------------------------------------------
+# Circuit breaker: track per-model upstream failures so a rate-limited model
+# stops being selected for a cooldown window instead of hammering it.
+# ---------------------------------------------------------------------------
+_BREAKER = {}            # model -> (fail_count, first_fail_ts, open_until)
+_BREAKER_THRESHOLD = 2   # consecutive failures before opening
+_BREAKER_OPEN_S = 60.0   # how long a model is skipped
+_BREAKER_HALF_S = 30.0   # half-open probe window
+
+def breaker_record(model, ok):
+    """Record upstream result. Returns True if model is currently available."""
+    now = time.time()
+    entry = _BREAKER.get(model)
+    if ok:
+        if entry:
+            _BREAKER.pop(model, None)
+        return True
+    if entry is None:
+        _BREAKER[model] = (1, now, 0.0)
+        return True
+    count, first_ts, open_until = entry
+    count += 1
+    if count >= _BREAKER_THRESHOLD and open_until == 0.0:
+        open_until = now + _BREAKER_OPEN_S
+    _BREAKER[model] = (count, first_ts, open_until)
+    return open_until == 0.0 or now >= open_until
+
+def breaker_available(model):
+    """Check if a model is available (not in open circuit state)."""
+    entry = _BREAKER.get(model)
+    if entry is None:
+        return True
+    count, first_ts, open_until = entry
+    now = time.time()
+    if open_until == 0.0:
+        return True
+    # Half-open: allow one probe after the cooldown
+    if now >= open_until + _BREAKER_HALF_S:
+        _BREAKER[model] = (0, now, 0.0)  # reset to allow probe
+        return True
+    return now >= open_until
+
+def breaker_pick(preferred_model):
+    """If preferred model is open, pick the next available tier upward."""
+    if breaker_available(preferred_model):
+        return preferred_model, False
+    idx = TIERS.index(preferred_model) if preferred_model in TIERS else 0
+    for candidate in list(TIERS[idx+1:]) + list(TIERS[:idx]):
+        if breaker_available(candidate):
+            return candidate, True
+    return preferred_model, False  # all open; let it try anyway
+
+# ---------------------------------------------------------------------------
+# Route cache: cache Jev routing decisions for identical retry requests so a
+# retry storm does not re-spend TypeSafe credits on the same routing call.
+# ---------------------------------------------------------------------------
+_ROUTE_CACHE = {}
+_ROUTE_CACHE_MAX = 200
+_ROUTE_CACHE_TTL = 45.0
+
+def _route_cache_key(thread_key, task, step, signals):
+    raw = "{}|{}|{}|{}".format(
+        thread_key or "", (task or "")[:300],
+        step.get("step_type"), signals.get("tool_history"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+def _route_cache_get(key):
+    entry = _ROUTE_CACHE.get(key)
+    if not entry:
+        return None
+    decision, ts = entry
+    if time.time() - ts > _ROUTE_CACHE_TTL:
+        _ROUTE_CACHE.pop(key, None)
+        return None
+    return decision
+
+def _route_cache_put(key, decision):
+    if len(_ROUTE_CACHE) >= _ROUTE_CACHE_MAX:
+        oldest = min(_ROUTE_CACHE, key=lambda k: _ROUTE_CACHE[k][1])
+        _ROUTE_CACHE.pop(oldest, None)
+    _ROUTE_CACHE[key] = (decision, time.time())
+
 
 
 def validate_ask(body):
@@ -1071,6 +1155,7 @@ class Handler(BaseHTTPRequestHandler):
         decision = None
         jev_usage = None
         smart_gate = None
+        cache_key = _route_cache_key(thread_key, task, step, signals)
         if os.path.exists(OFF_PATH):
             model, effort, speed, gate = ASTRA, None, "default", "off"
         else:
@@ -1079,28 +1164,42 @@ class Handler(BaseHTTPRequestHandler):
                 jt0 = time.time()
                 state = jev_state(task, prev_assistant, signals, step)
                 state = enrich_jev_state(state, task, session, repo, failure_streak)
+                cached_decision = _route_cache_get(cache_key)
                 try:
-                    result = call_jev_routed(key, state)
-                    decision = decision_from_answers(result.get("answers"))
-                    raw_usage = result.get("usage") or {}
-                    if not isinstance(raw_usage, dict):
-                        raw_usage = {}
-                    jev_usage = {k: v for k, v in raw_usage.items()
-                                 if k in ("input_tokens", "output_tokens", "inputTokens", "outputTokens")
-                                 and isinstance(v, int) and not isinstance(v, bool) and v >= 0}
-                    tier, depth, conf = (decision["model"], decision["effort"],
-                                         decision["confidence"])
+                    if cached_decision is not None:
+                        decision = cached_decision
+                        tier, depth, conf = (decision["model"], decision["effort"],
+                                             decision["confidence"])
+                    else:
+                        result = call_jev_routed(key, state)
+                        decision = decision_from_answers(result.get("answers"))
+                        raw_usage = result.get("usage") or {}
+                        if not isinstance(raw_usage, dict):
+                            raw_usage = {}
+                        jev_usage = {k: v for k, v in raw_usage.items()
+                                     if k in ("input_tokens", "output_tokens", "inputTokens", "outputTokens")
+                                     and isinstance(v, int) and not isinstance(v, bool) and v >= 0}
+                        tier, depth, conf = (decision["model"], decision["effort"],
+                                             decision["confidence"])
                     model, effort, speed, gate = route(tier, depth)
                     model, effort, smart_gate = apply_guardrails(
                         model, effort, task, step, session, failure_streak)
+                    # Circuit breaker: skip a model whose circuit is open.
+                    alt_model, rerouted = breaker_pick(model)
+                    if rerouted:
+                        model = alt_model
+                        smart_gate = (smart_gate + "+" if smart_gate != "apply" else "") + "breaker_reroute"
+                    if cached_decision is not None and smart_gate == "apply":
+                        gate = "apply+cache"
                     if smart_gate != "apply":
                         gate = f"{gate}+{smart_gate}"
+                    if cached_decision is None:
+                        _route_cache_put(cache_key, decision)
                 except Exception as exc:
                     model, effort, speed, gate = ASTRA, "medium", "default", f"jev_error:{type(exc).__name__}"
                 jev_ms = int((time.time() - jt0) * 1000)
             else:
                 model, effort, speed, gate = ASTRA, "medium", "default", "no_key_or_task"
-
         # Capture the production smart route before operational shadow/dry
         # overrides. The raw Jev route remains tier/depth above.
         smart_model, smart_effort, smart_speed, smart_route_gate = (
@@ -1153,6 +1252,11 @@ class Handler(BaseHTTPRequestHandler):
         retried = False
         fallback = None
 
+
+        # Record upstream result into the circuit breaker so consecutive
+        # failures open the circuit and stop selecting this model.
+        upstream_ok = status == 200
+        breaker_record(model, upstream_ok)
         finished_at = time.strftime("%Y-%m-%dT%H:%M:%S")
         total_ms = int((time.time() - t0) * 1000)
         log_line({
@@ -1229,7 +1333,7 @@ class Handler(BaseHTTPRequestHandler):
         """
         body = json.dumps(payload).encode("utf-8")
         conn = http.client.HTTPConnection(*ROUTER, timeout=900)
-        status = 0
+        conn = http.client.HTTPConnection(*ROUTER, timeout=60)
         out_kind = ""
         ctype = ""
         attempt = {"model": model, "effort": (payload.get("reasoning") or {}).get("effort"),
