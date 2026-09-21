@@ -105,10 +105,16 @@ else
 fi
 
 echo "== 4/8  Jev local service =="
+SERVICE_STATE_DIR="${CODEX_ROUTER_STATE_DIR:-$HOME/.codex/codex-router}"
 if [ -n "${JEV_ENV_FILE:-}" ]; then
-  JEV_ENV_FILE="$JEV_ENV_FILE" bash "$HERE/server/install-service.sh"
+  CODEX_ROUTER_DIR="$ROUTER_DIR" \
+  CODEX_ROUTER_STATE_DIR="$SERVICE_STATE_DIR" \
+  JEV_ENV_FILE="$JEV_ENV_FILE" \
+    bash "$HERE/server/install-service.sh"
 else
-  bash "$HERE/server/install-service.sh"
+  CODEX_ROUTER_DIR="$ROUTER_DIR" \
+  CODEX_ROUTER_STATE_DIR="$SERVICE_STATE_DIR" \
+    bash "$HERE/server/install-service.sh"
 fi
 
 echo "== 5/8  Provider discovery =="

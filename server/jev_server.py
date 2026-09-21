@@ -403,6 +403,70 @@ _NATIVE_REDIRECT_LOCK = threading.Lock()
 _NATIVE_REDIRECT_NAME = "native-redirect.json"
 _NATIVE_REDIRECT_HELD_NAME = "native-redirect.json.routing-held"
 _NATIVE_REDIRECT_DEPTH = 0
+_EXACT_NATIVE_ROUTE_ENV = "JEV_EXACT_NATIVE_ROUTE"
+_EXACT_NATIVE_ROUTE_MARKER = "jev-exact-native-route.json"
+_EXACT_NATIVE_ROUTE_CONDITION = b"if (!registeredRoute && requestedModel && !exactRouteProbe) {"
+_EXACT_NATIVE_ROUTE_PROBE = b"const exactRouteProbe = exactRouteProbeRequested(request.headers);"
+_EXACT_NATIVE_ROUTE_REDIRECT = b"const redirect = MODEL_BY_SLUG.get(readNativeRedirect());"
+_exact_native_route_cache = None
+
+
+def exact_native_route_supported():
+    """Whether the supervised Node caller edge can bypass native redirect exactly.
+
+    The supervisor opts in only after the guarded source patch has been loaded by
+    a successful Codex Router restart. The arm marker binds that restart to the
+    exact router.mjs bytes. If an external router update replaces the source,
+    this check immediately falls back to legacy suppression instead of recursing.
+    """
+    global _exact_native_route_cache
+    if os.environ.get(_EXACT_NATIVE_ROUTE_ENV) != "1" or not CODEX_ROUTER_DIR:
+        return False
+
+    path = os.path.join(CODEX_ROUTER_DIR, "src", "router.mjs")
+    marker_path = os.path.join(STATE, _EXACT_NATIVE_ROUTE_MARKER)
+    try:
+        source_stat = os.stat(path)
+        marker_stat = os.stat(marker_path)
+    except OSError:
+        return False
+
+    cache_key = (
+        path,
+        source_stat.st_mtime_ns,
+        source_stat.st_size,
+        marker_path,
+        marker_stat.st_mtime_ns,
+        marker_stat.st_size,
+    )
+    if _exact_native_route_cache and _exact_native_route_cache[:6] == cache_key:
+        return _exact_native_route_cache[6]
+
+    try:
+        with open(marker_path, encoding="utf-8") as fh:
+            marker = json.load(fh)
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except (OSError, ValueError):
+        supported = False
+    else:
+        marker_router = marker.get("router") if isinstance(marker, dict) else None
+        same_router = (
+            isinstance(marker_router, str)
+            and os.path.normcase(os.path.realpath(marker_router))
+            == os.path.normcase(os.path.realpath(path))
+        )
+        supported = (
+            isinstance(marker, dict)
+            and marker.get("version") == 1
+            and same_router
+            and marker.get("router_sha256") == hashlib.sha256(data).hexdigest()
+            and _EXACT_NATIVE_ROUTE_CONDITION in data
+            and _EXACT_NATIVE_ROUTE_PROBE in data
+            and _EXACT_NATIVE_ROUTE_REDIRECT in data
+        )
+    _exact_native_route_cache = (*cache_key, supported)
+    return supported
 
 
 def _native_redirect_paths():
@@ -498,6 +562,16 @@ def native_redirect_suppressed():
 # Repair an interrupted suppression before the server starts answering status
 # or forwarding requests.
 recover_native_redirect()
+
+
+@contextlib.contextmanager
+def concrete_native_forward():
+    """Prefer caller-edge exact routing; retain file suppression as safe fallback."""
+    if exact_native_route_supported():
+        yield
+        return
+    with native_redirect_suppressed():
+        yield
 
 
 def key_paths():
@@ -1323,6 +1397,7 @@ class Handler(BaseHTTPRequestHandler):
                 snapshot["auto"] = held_model == "jev/auto"
         snapshot["route"] = last_route_status() or None
         snapshot["policy_version"] = POLICY_VERSION
+        snapshot["exact_native_route"] = exact_native_route_supported()
         return snapshot
 
     def _auto_control(self):
@@ -1621,7 +1696,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 apply_route(payload, attempt_model, attempt_effort)
                 quota_hit = False
-                with native_redirect_suppressed():
+                with concrete_native_forward():
                     try:
                         status, out_kind, ctype, quota_hit, _u, _r, error_bytes = self._forward(
                             payload, out_path, stream_requested, debug, marker,
@@ -1676,7 +1751,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._write_error_response(status, error_bytes)
             else:
                 apply_route(payload, model, effort)
-                with native_redirect_suppressed():
+                with concrete_native_forward():
                     try:
                         status, out_kind, ctype, quota_hit, _u, _r, error_bytes = self._forward(
                             payload, out_path, stream_requested, debug, marker, model, signature)
@@ -1809,7 +1884,15 @@ class Handler(BaseHTTPRequestHandler):
                 "POST",
                 f"/_codex-router/{caller_secret()}{out_path}",
                 body=body,
-                headers={"Content-Type": "application/json", "Accept": "text/event-stream"},
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "text/event-stream",
+                    # Codex Router already uses this authenticated-caller probe
+                    # to mean "serve the requested route exactly". The local
+                    # source hook extends that same meaning to native redirect,
+                    # so a Jev-selected native tier cannot recurse to jev/auto.
+                    "x-codex-router-exact-route": "1",
+                },
             )
             resp = conn.getresponse()
             # Headers arrived: allow a longer window for the streamed body

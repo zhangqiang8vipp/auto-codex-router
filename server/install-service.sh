@@ -37,6 +37,22 @@ if [ ! -r "$KEY_FILE" ]; then
 fi
 chmod 600 "$KEY_FILE" 2>/dev/null || true
 
+STATE_DIR="${CODEX_ROUTER_STATE_DIR:-$HOME/.codex/codex-router}"
+export CODEX_ROUTER_STATE_DIR="$STATE_DIR"
+EXACT_NATIVE_ROUTE=""
+PATCHER="$REPO/server/patch_codex_router.py"
+if [ -n "${CODEX_ROUTER_DIR:-}" ] && [ -f "$PATCHER" ]; then
+  if "$PYTHON" "$PATCHER" \
+    --router-dir "$CODEX_ROUTER_DIR" \
+    --state-dir "$STATE_DIR" \
+    --restart; then
+    EXACT_NATIVE_ROUTE="1"
+  else
+    echo "WARNING: scoped exact native routing is unavailable; using legacy redirect suppression." >&2
+  fi
+fi
+export JEV_EXACT_NATIVE_ROUTE="$EXACT_NATIVE_ROUTE"
+
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -57,8 +73,7 @@ cat > "$PLIST" <<EOF
 </plist>
 EOF
 
-if [ -n "${JEV_ENV_FILE:-}" ]; then
-  JEV_ENV_FILE="$JEV_ENV_FILE" "$PYTHON" - "$PLIST" <<'PY'
+"$PYTHON" - "$PLIST" <<'PY'
 import os
 import plistlib
 import sys
@@ -66,13 +81,28 @@ import sys
 path = sys.argv[1]
 with open(path, "rb") as fh:
     plist = plistlib.load(fh)
-plist["EnvironmentVariables"] = {
-    "JEV_ENV_FILE": os.path.realpath(os.path.expanduser(os.environ["JEV_ENV_FILE"]))
-}
+
+environment = {}
+jev_env_file = os.environ.get("JEV_ENV_FILE", "").strip()
+if jev_env_file:
+    environment["JEV_ENV_FILE"] = os.path.realpath(os.path.expanduser(jev_env_file))
+router_dir = os.environ.get("CODEX_ROUTER_DIR", "").strip()
+if router_dir:
+    environment["CODEX_ROUTER_DIR"] = os.path.realpath(os.path.expanduser(router_dir))
+state_dir = os.environ.get("CODEX_ROUTER_STATE_DIR", "").strip()
+if state_dir:
+    environment["CODEX_ROUTER_STATE_DIR"] = os.path.realpath(os.path.expanduser(state_dir))
+if os.environ.get("JEV_EXACT_NATIVE_ROUTE") == "1":
+    environment["JEV_EXACT_NATIVE_ROUTE"] = "1"
+
+if environment:
+    plist["EnvironmentVariables"] = environment
+else:
+    plist.pop("EnvironmentVariables", None)
+
 with open(path, "wb") as fh:
     plistlib.dump(plist, fh, sort_keys=False)
 PY
-fi
 
 # Replace any existing instance (watchdog / former label) with the service.
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
