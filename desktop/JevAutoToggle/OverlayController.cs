@@ -17,9 +17,8 @@ internal sealed class OverlayController : IDisposable
     private AutoSnapshot _snapshot = new(false, false, "Connecting to Jev Router…", null, null);
     private bool _busy;
     private bool _statusInFlight;
-    private bool _anchorVisible;
+    private bool _hasComposerAnchor;
     private string? _lastAnchorLabel;
-
     public OverlayController(Dispatcher dispatcher)
     {
         _dispatcher = dispatcher;
@@ -29,7 +28,12 @@ internal sealed class OverlayController : IDisposable
         _uiTimer = new DispatcherTimer(
             TimeSpan.FromMilliseconds(400),
             DispatcherPriority.Background,
-            (_, _) => RefreshAnchor(),
+            (_, _) => {
+                RefreshAnchor();
+                // Re-assert topmost so the badge never falls behind the
+                // Codex WebView surface between anchor refreshes.
+                if (_overlay.IsVisible) _overlay.Topmost = true;
+            },
             dispatcher);
 
         _statusTimer = new DispatcherTimer(
@@ -41,6 +45,8 @@ internal sealed class OverlayController : IDisposable
 
     public void Start()
     {
+        _overlay.SetFixedPosition();
+        _overlay.Hide();
         _uiTimer.Start();
         _statusTimer.Start();
         _ = RefreshStatusAsync();
@@ -51,7 +57,7 @@ internal sealed class OverlayController : IDisposable
         CodexAnchor? anchor;
         try
         {
-            anchor = _tracker.TryFindReasoningAnchor();
+            anchor = _tracker.TryFindComposerStripAnchor();
         }
         catch
         {
@@ -60,17 +66,20 @@ internal sealed class OverlayController : IDisposable
 
         if (anchor is null)
         {
-            _anchorVisible = false;
-            _lastAnchorLabel = null;
-            _overlay.Hide();
-            _diagnostics.Write(false, null, _snapshot, "reasoning anchor not found in foreground window");
+            // Codex is not in the foreground — hide the badge so it never
+            // floats over other apps.
+            if (_overlay.IsVisible) _overlay.Hide();
+            _hasComposerAnchor = false;
+            _diagnostics.Write(false, _lastAnchorLabel, _snapshot,
+                "codex not in foreground; hiding overlay");
             return;
         }
 
-        _anchorVisible = true;
+        _hasComposerAnchor = true;
         _lastAnchorLabel = anchor.Label;
         _overlay.SetAnchor(anchor);
         if (!_overlay.IsVisible) _overlay.Show();
+        _overlay.Topmost = true;
         _diagnostics.Write(true, _lastAnchorLabel, _snapshot);
     }
 
@@ -96,25 +105,45 @@ internal sealed class OverlayController : IDisposable
         }
 
         _overlay.SetState(_snapshot, _busy);
-        _diagnostics.Write(_anchorVisible, _lastAnchorLabel, _snapshot);
+        _diagnostics.Write(_hasComposerAnchor, _lastAnchorLabel, _snapshot);
+    }
+
+    private static readonly string ClickLog = System.IO.Path.Combine(
+        System.Environment.GetFolderPath(System.Environment.SpecialFolder.UserProfile),
+        ".codex", "codex-router", "jev-auto-toggle.click.log");
+
+    private static void Log(string msg)
+    {
+        try { System.IO.File.AppendAllText(ClickLog, $"[{DateTime.Now:HH:mm:ss.fff}] {msg}\n"); }
+        catch { }
     }
 
     private async void OnToggleRequested(object? sender, EventArgs e)
     {
-        if (_busy || !_snapshot.Available) return;
+        Log($"OnToggleRequested enter: busy={_busy} avail={_snapshot.Available} auto={_snapshot.Auto}");
+        if (_busy || !_snapshot.Available)
+        {
+            Log("bail: busy or not available");
+            return;
+        }
         _busy = true;
         _overlay.SetState(_snapshot, busy: true);
 
         try
         {
-            _snapshot = await _router.SetAutoAsync(!_snapshot.Auto, _cts.Token);
+            var target = !_snapshot.Auto;
+            Log($"calling SetAutoAsync({target})");
+            _snapshot = await _router.SetAutoAsync(target, _cts.Token);
+            Log($"result: auto={_snapshot.Auto} avail={_snapshot.Available} err={_snapshot.Error}");
         }
         catch (OperationCanceledException)
         {
+            Log("cancelled");
             return;
         }
         catch (Exception ex)
         {
+            Log($"EXCEPTION {ex.GetType().Name}: {ex.Message}");
             _snapshot = new AutoSnapshot(
                 _snapshot.Auto,
                 false,

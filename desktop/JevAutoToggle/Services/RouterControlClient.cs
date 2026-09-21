@@ -24,11 +24,17 @@ internal sealed class RouterControlClient : IDisposable
 
     public async Task<AutoSnapshot> SetAutoAsync(bool enabled, CancellationToken cancellationToken)
     {
-        using var response = await _http.PostAsJsonAsync(
-            "control/auto",
-            new { enabled },
-            cancellationToken);
+        var json = JsonSerializer.Serialize(new { enabled });
+        using var content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+        using var response = await _http.PostAsync("control/auto", content, cancellationToken);
         var raw = await response.Content.ReadAsStringAsync(cancellationToken);
+        try {
+            var logPath = System.IO.Path.Combine(
+                System.Environment.GetFolderPath(System.Environment.SpecialFolder.UserProfile),
+                ".codex", "codex-router", "jev-auto-toggle.click.log");
+            System.IO.File.AppendAllText(logPath,
+                $"[{DateTime.Now:HH:mm:ss.fff}] POST control/auto enabled={enabled} body={json} -> HTTP {(int)response.StatusCode}: {raw}\n");
+        } catch { }
         return Parse(raw, response.IsSuccessStatusCode);
     }
 

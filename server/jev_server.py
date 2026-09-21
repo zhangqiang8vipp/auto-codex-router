@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """Jev Codex Router — local server on 127.0.0.1:4319 for the Codex Router.
 
 Receives Responses requests destined for the "jev/auto" model (the Codex
@@ -1310,11 +1310,20 @@ class Handler(BaseHTTPRequestHandler):
                             headerer._sign_message_item(item)
                         data = json.dumps(assembled).encode("utf-8")
                         out_ctype = "application/json"
-                self.send_response(status)
-                self.send_header("Content-Type", out_ctype)
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
+                if status != 200 and stream_requested:
+                    out_kind = "json"
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Connection", "close")
+                    self.end_headers()
+                    self.wfile.write(data)
+                else:
+                    self.send_response(status)
+                    self.send_header("Content-Type", out_ctype)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
             return status, out_kind, ctype, False, None, None
         finally:
             attempt["status"] = status

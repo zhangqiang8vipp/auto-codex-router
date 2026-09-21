@@ -8,28 +8,7 @@ internal sealed record CodexAnchor(IntPtr WindowHandle, int ProcessId, Rect Boun
 
 internal sealed class CodexUiTracker
 {
-    // These labels identify the native reasoning selector itself, rather than a
-    // selected effort value. They are safe to trust on the foreground window
-    // without guessing the packaged app's process name.
-    private static readonly string[] StrongAnchorNames =
-    [
-        "选择强度",
-        "Select reasoning",
-        "Reasoning effort",
-        "Choose reasoning"
-    ];
-
-    private static readonly string[] ChineseEffortNames =
-    [
-        "轻度", "中等", "高", "极高", "最高"
-    ];
-
-    private static readonly string[] EnglishEffortNames =
-    [
-        "low", "medium", "high", "extra high", "xhigh", "max", "ultra"
-    ];
-
-    public CodexAnchor? TryFindReasoningAnchor()
+    public CodexAnchor? TryFindComposerStripAnchor()
     {
         var foreground = NativeWindowStyles.GetForegroundWindow();
         if (foreground == IntPtr.Zero)
@@ -45,42 +24,29 @@ internal sealed class CodexUiTracker
             if (windowBounds.IsEmpty || windowBounds.Width < 500 || windowBounds.Height < 350)
                 return null;
 
-            // First prefer the selector's own localized name. This survives
-            // packaged-process renames and WebView host process changes.
-            var strong = FindStrongAnchors(window);
-            var best = PickBest(window, foreground, windowBounds, strong, requireCodexEvidence: false);
-            if (best is not null)
-                return best;
+            // The model selector is the stable visual neighbour requested by
+            // the user. It is preferred over the effort selector because the
+            // effort selector can be absent until the composer is expanded.
+            if (LooksLikeCodexWindow(window))
+            {
+                var model = PickBest(
+                    window,
+                    foreground,
+                    windowBounds,
+                    FindComposerControls(window),
+                    requireModelName: true);
+                if (model is not null)
+                    return model;
+            }
 
-            // Some builds expose only the selected value (e.g. Ultra/High).
-            // Keep this fallback conservative by requiring Codex-like window
-            // evidence before accepting a generic effort word.
-            if (!LooksLikeCodexWindow(window))
-                return null;
-
-            var fallback = FindEffortValueControls(window);
-            return PickBest(window, foreground, windowBounds, fallback, requireCodexEvidence: true);
+            return null;
         }
         catch (ElementNotAvailableException) { return null; }
         catch (COMException) { return null; }
         catch (InvalidOperationException) { return null; }
     }
 
-    private static AutomationElementCollection FindStrongAnchors(AutomationElement window)
-    {
-        var conditions = StrongAnchorNames
-            .Select(name => (System.Windows.Automation.Condition)
-                new PropertyCondition(AutomationElement.NameProperty, name))
-            .ToArray();
-
-        return window.FindAll(
-            TreeScope.Descendants,
-            conditions.Length == 1
-                ? conditions[0]
-                : new System.Windows.Automation.OrCondition(conditions));
-    }
-
-    private static AutomationElementCollection FindEffortValueControls(AutomationElement window)
+    private static AutomationElementCollection FindComposerControls(AutomationElement window)
     {
         return window.FindAll(
             TreeScope.Descendants,
@@ -101,7 +67,7 @@ internal sealed class CodexUiTracker
         IntPtr foreground,
         Rect windowBounds,
         AutomationElementCollection candidates,
-        bool requireCodexEvidence)
+        bool requireModelName)
     {
         CodexAnchor? best = null;
         double bestScore = double.MinValue;
@@ -117,7 +83,7 @@ internal sealed class CodexUiTracker
                 if (string.IsNullOrWhiteSpace(label))
                     continue;
 
-                if (requireCodexEvidence && !LooksLikeEffortValue(label))
+                if (requireModelName && !LooksLikeModelName(label))
                     continue;
 
                 var bounds = candidate.Current.BoundingRectangle;
@@ -135,9 +101,7 @@ internal sealed class CodexUiTracker
                     1.0,
                     Math.Abs(windowBounds.Bottom - bounds.Bottom) / Math.Max(1.0, windowBounds.Height));
                 var rightness = (bounds.Left - windowBounds.Left) / Math.Max(1.0, windowBounds.Width);
-                var strongBonus = StrongAnchorNames.Any(
-                    name => label.Equals(name, StringComparison.OrdinalIgnoreCase)) ? 3.0 : 0.0;
-                var score = strongBonus + bottomProximity + rightness;
+                var score = bottomProximity + rightness;
 
                 if (score <= bestScore)
                     continue;
@@ -190,12 +154,7 @@ internal sealed class CodexUiTracker
         return false;
     }
 
-    private static bool LooksLikeEffortValue(string label)
-    {
-        var normalized = label.Trim().ToLowerInvariant();
-        return ChineseEffortNames.Any(
-                   name => normalized.Equals(name, StringComparison.OrdinalIgnoreCase))
-               || EnglishEffortNames.Any(
-                   name => normalized.Equals(name, StringComparison.OrdinalIgnoreCase));
-    }
+    private static bool LooksLikeModelName(string label) =>
+        label.StartsWith("GPT-", StringComparison.OrdinalIgnoreCase)
+        || label.StartsWith("gpt-", StringComparison.OrdinalIgnoreCase);
 }

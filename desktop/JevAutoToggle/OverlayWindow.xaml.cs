@@ -22,11 +22,19 @@ public partial class OverlayWindow : Window
         base.OnSourceInitialized(e);
         var handle = new WindowInteropHelper(this).Handle;
         var style = NativeWindowStyles.GetWindowLongPtr(handle, NativeWindowStyles.GwlExStyle).ToInt64();
-        style |= NativeWindowStyles.WsExNoActivate | NativeWindowStyles.WsExToolWindow;
+        // Keep tool-window styling (no taskbar, no alt-tab entry) but drop
+        // WS_EX_NOACTIVATE: it can swallow mouse-button messages on layered
+        // WPF windows, making the badge look dead even though the timer keeps
+        // refreshing.
+        style |= NativeWindowStyles.WsExToolWindow;
+        style &= ~NativeWindowStyles.WsExNoActivate;
         _ = NativeWindowStyles.SetWindowLongPtr(
             handle,
             NativeWindowStyles.GwlExStyle,
             new IntPtr(style));
+        // Re-assert topmost every time the window is shown so the badge never
+        // gets buried under the Codex WebView surface.
+        Topmost = true;
     }
 
     internal void SetAnchor(CodexAnchor anchor)
@@ -42,8 +50,24 @@ public partial class OverlayWindow : Window
         var anchorTop = anchor.Bounds.Top / scale;
         var anchorHeight = anchor.Bounds.Height / scale;
 
-        Left = anchorLeft - Width - 8;
+        // Codex places its compact/compaction circle immediately to the left
+        // of the model selector. Reserve that control's visual width and put
+        // Auto to its left, so this remains correct when the selected model
+        // name changes.
+        const double compactionControlWidth = 44;
+        Left = anchorLeft - compactionControlWidth - Width - 5;
         Top = anchorTop + (anchorHeight - Height) / 2.0;
+    }
+
+    internal void SetFixedPosition()
+    {
+        // Keep Auto available even when Codex's WebView does not expose its
+        // composer controls through UI Automation. WorkArea already excludes
+        // the taskbar, so the pill stays visible without covering it.
+        var workArea = SystemParameters.WorkArea;
+        const double margin = 24;
+        Left = workArea.Right - Width - margin;
+        Top = workArea.Bottom - Height - margin;
     }
 
     internal void SetState(AutoSnapshot snapshot, bool busy)
@@ -53,20 +77,14 @@ public partial class OverlayWindow : Window
 
         if (!snapshot.Available || !string.IsNullOrWhiteSpace(snapshot.Error))
         {
-            SetResource("Pill", Border.BackgroundProperty, "ErrorBackground");
-            SetResource("Pill", Border.BorderBrushProperty, "ErrorBorder");
-            SetResource("Label", TextBlock.ForegroundProperty, "ErrorText");
-            SetResource("StatusDot", System.Windows.Shapes.Shape.FillProperty, "ErrorText");
+            SetResource("Icon", TextBlock.ForegroundProperty, "ErrorText");
             AutoButton.ToolTip = snapshot.Error ?? "Jev Auto control unavailable.";
             return;
         }
 
         if (snapshot.Auto)
         {
-            SetResource("Pill", Border.BackgroundProperty, "OnBackground");
-            SetResource("Pill", Border.BorderBrushProperty, "OnBorder");
-            SetResource("Label", TextBlock.ForegroundProperty, "OnText");
-            SetResource("StatusDot", System.Windows.Shapes.Shape.FillProperty, "OnDot");
+            SetResource("Icon", TextBlock.ForegroundProperty, "OnText");
 
             var route = snapshot.Route;
             AutoButton.ToolTip = route is { Model: not null }
@@ -75,10 +93,7 @@ public partial class OverlayWindow : Window
         }
         else
         {
-            SetResource("Pill", Border.BackgroundProperty, "OffBackground");
-            SetResource("Pill", Border.BorderBrushProperty, "OffBorder");
-            SetResource("Label", TextBlock.ForegroundProperty, "OffText");
-            SetResource("StatusDot", System.Windows.Shapes.Shape.FillProperty, "OffDot");
+            SetResource("Icon", TextBlock.ForegroundProperty, "OffText");
             AutoButton.ToolTip = string.IsNullOrWhiteSpace(snapshot.RedirectModel)
                 ? "Auto OFF\nCodex native model + reasoning controls are active."
                 : $"Auto OFF\nRestored Codex Router redirect: {snapshot.RedirectModel}";
@@ -102,6 +117,17 @@ public partial class OverlayWindow : Window
         target.SetValue(property, FindResource(resource) as Brush);
     }
 
-    private void AutoButton_OnClick(object sender, RoutedEventArgs e) =>
+    private void AutoButton_OnClick(object sender, RoutedEventArgs e)
+    {
+        try
+        {
+            var logPath = System.IO.Path.Combine(
+                System.Environment.GetFolderPath(System.Environment.SpecialFolder.UserProfile),
+                ".codex", "codex-router", "jev-auto-toggle.click.log");
+            System.IO.File.AppendAllText(logPath,
+                $"[{DateTime.Now:HH:mm:ss.fff}] click received\n");
+        }
+        catch { }
         ToggleRequested?.Invoke(this, EventArgs.Empty);
+    }
 }
