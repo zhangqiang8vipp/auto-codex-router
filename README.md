@@ -24,7 +24,7 @@ See [Fork and customize](#fork-and-customize--允许自己改) below.
 
 ```
 Codex ──▶ Codex Router (:4202)
-            ├─ native models ─────────────▶ ChatGPT backend (your plan)
+            ├─ native models ──────────────▶ ChatGPT backend (your plan)
             └─ "jev/auto" ─▶ LiteLLM ─▶ API forwarder
                                      │
                                      ▼
@@ -34,7 +34,7 @@ Codex ──▶ Codex Router (:4202)
                             │    (model, reasoning.effort, service_tier)
                             ▼
                           local caller edge (shared native session)
-                            └──▶ luna / sol / astra on the ChatGPT backend
+                            └──▶ luna / terra / sol / astra on the ChatGPT backend
 ```
 
 - **Responses in, Responses out** — no format conversion; the SSE stream is
@@ -42,7 +42,7 @@ Codex ──▶ Codex Router (:4202)
 - **Fail-open** — any Jev error keeps the turn alive (safe fallback route).
 - **Kill switch** — a sentinel file routes without Jev, instantly.
 - **Codex-dry tandem** — when native (ChatGPT) usage is exhausted (sentinel
-  file, or an observed 429 / usage-limit response), the triptych is replaced:
+  file, or an observed 429 / usage-limit response), the four-tier native set is replaced:
   GLM (`opencode-go/glm-5.3-flash`) for frontier-tier steps, deepseek
   (`opencode-go/deepseek-v4.1-flash`) for everything else. The failed call is
   retried on the tandem, at the thinking depth Jev decided, mapped onto the Go
@@ -54,11 +54,12 @@ Codex ──▶ Codex Router (:4202)
 
 ## Routing policy
 
-The shared contract in `server/routing_policy.py` gives Jev 15 explicit pairs:
-Luna, Sol or Astra × low, medium, high, xhigh or max thinking. Jev chooses the
-pair in one Choice question, using capability profiles and the current request,
-recent assistant intent, and the available tool result. Every pair uses standard
-speed, overriding an incoming Fast setting, including retries and bypass modes.
+The shared contract in `server/routing_policy.py` gives Jev 20 explicit pairs:
+Luna, Terra, Sol or Astra × low, medium, high, xhigh or max thinking. Jev chooses
+the pair in one Choice question using capability profiles, the current request,
+recent assistant intent, the latest tool evidence, and bounded session/repository
+signals. Every pair uses standard speed, overriding an incoming Fast setting,
+including retries and bypass modes.
 
 There is no preferred model, target distribution, keyword-to-model rule,
 low-confidence fallback to Sol, mechanical-step exception, or compaction pin.
@@ -74,19 +75,35 @@ A missing/invalid Jev response or a provider error still uses the separately
 logged technical fail-open route (Astra at medium); the manual kill switch and
 native-quota exhaustion are operational bypasses, not Jev decisions.
 
+### Smart continuity guardrails
+
+The smart-router branch keeps Jev as the semantic chooser but adds bounded local
+evidence and deterministic recovery rules:
+
+- only a hashed thread key, previous model/effort, failure streak, project basename,
+  dirty-file count and aggregate diff-line count are retained;
+- source code, filenames and absolute paths are not sent to Jev;
+- one failed tool call cannot immediately downgrade model or reasoning effort;
+- two consecutive failed tool steps floor the next call at Sol + high;
+- three floor it at Astra + xhigh, while max remains a Jev decision;
+- a very short continuation can lower model and effort by at most one rung, while
+  a successful mechanical tool continuation may still fall directly to Luna + low.
+
+These are recovery/continuity floors, not keyword-based task classification.
+
 ### Codex-dry tandem — only while native usage is exhausted
 
-The triptych is the policy **unless** the ChatGPT usage window is exhausted
+The four-tier native set is the policy **unless** the ChatGPT usage window is exhausted
 (manual sentinel file, or an automatic flip on a 429 / usage-limit response,
 which also retries the failed call on the tandem). While dry:
 
 | Native tier | Dry substitute |
 |---|---|
 | `gpt-6-astra` (frontier) | `opencode-go/glm-5.3-flash` |
-| `gpt-5.6-sol` / `gpt-5.6-luna` | `opencode-go/deepseek-v4.1-flash` |
+| `gpt-5.6-sol` / `gpt-5.6-terra` / `gpt-5.6-luna` | `opencode-go/deepseek-v4.1-flash` |
 
 An automatic flip lasts until the instant the edge announced for the window
-reset, so the first call after the quota returns is served by the triptych
+reset, so the first call after the quota returns is served by the native four-tier set
 again; when a refusal announces no instant it falls back to a 30-minute
 re-probe, and a week is the ceiling on anything a refusal claims. It is cleared
 by the first successful native call, and the manual sentinel file is never
@@ -95,7 +112,7 @@ auto-cleared.
 Two details keep the substitute transparent. The decided depth travels with the
 call, mapped onto the Go ladder — `low` stays `low`, `medium` and `high` become
 `high`, `xhigh` or above become `max` — because those models declare three rungs
-where the triptych exposes five, and the API forwarder clamps the value once more
+where the native models expose five, and the API forwarder clamps the value once more
 onto the route's own ladder. And a tandem call that comes back retryable
 (429/5xx) is tried once on the sibling model: opencode Go meters the two Go
 models against separate allowances and reports a spent one the same way it
@@ -121,7 +138,7 @@ python3 server/report_routing.py --days 7          # text tables (default window
 python3 server/report_routing.py --days 30 --json  # machine-readable
 ```
 
-It prints the served model distribution (luna/sol/astra, plus the Codex-dry
+It prints the served model distribution (luna/terra/sol/astra, plus the Codex-dry
 tandem when it took over: turns + %), the share of turns served by the cheapest
 tier, the share of turns held below the confidence gate, the gates encountered,
 median latency (end-to-end and Jev's own decision time), and an estimate of the
@@ -177,19 +194,25 @@ hook/        Explored alternative (LiteLLM callback tap) — kept for reference
 Prerequisites: macOS, a Codex desktop install wired to a **Codex Router**
 (checkout with `bin/codex-router`), Python 3.11+, and a TypeSafe API key (Jev).
 
-**1. Give the server your TypeSafe key** — either
-`export TYPESAFE_API_KEY=...` in the service environment, or:
+**1. Give the server your TypeSafe key.** For persistent macOS use, store it in
+an owner-readable file (launchd does not inherit your interactive shell):
 
 ```bash
-echo 'TYPESAFE_API_KEY=your-key' >> ~/.hermes/.env   # default env file
-# (override the path with JEV_ENV_FILE=/path/to/env)
+mkdir -p ~/.hermes
+printf '%s\n' 'TYPESAFE_API_KEY=your-key' > ~/.hermes/.env
+chmod 600 ~/.hermes/.env
+# optional: JEV_ENV_FILE=/path/to/env bash server/install-service.sh
 ```
+
+A foreground run may also use `TYPESAFE_API_KEY` from the process environment.
 
 **2. Start the server** (foreground test):
 
 ```bash
 python3 server/jev_server.py
 curl -s http://127.0.0.1:4319/health
+# in another terminal, after Codex Router is running:
+python3 server/jev_server.py --check
 ```
 
 **3. Register with the Codex Router:**
@@ -221,7 +244,7 @@ cd <codex-router checkout>
       "provider": "jev",
       "listed": true,
       "displayName": "Jev Codex Router",
-      "description": "Auto-routing by Jev: every turn is classified and served by luna, sol or astra at the thinking depth it needs.",
+      "description": "Auto-routing by Jev: every call is served by luna, terra, sol or astra at the reasoning depth it needs.",
       "priority": 95,
       "defaultEffort": "medium",
       "reasoningLevels": [
@@ -273,7 +296,7 @@ stops answering.
 | Shadow mode (decide + log, serve astra) | `touch ~/.codex/codex-router/jev-router.shadow` |
 | Debug capture (shapes + raw streams) | `touch ~/.codex/codex-router/jev-router.debug` |
 | Kill switch (no Jev → frontier) | `touch ~/.codex/codex-router/jev-router.off` (delete the file to re-enable) |
-| Force the Codex-dry tandem | `touch ~/.codex/codex-router/jev-router.codex-dry` (delete the file to return to luna/sol/astra) |
+| Force the Codex-dry tandem | `touch ~/.codex/codex-router/jev-router.codex-dry` (delete the file to return to luna/terra/sol/astra) |
 | Inspect the dry auto state | `cat ~/.codex/codex-router/jev-router.codex-dry.json` (reason + expiry; auto-cleared by the next successful native call) |
 | Hide the model | `./bin/control picker set jev/auto hide` |
 | Disable the provider | `./bin/codex-router providers generic disable jev` |
@@ -317,22 +340,19 @@ decision and attempt logs provide observations, not quality labels.
 This tree is MIT. Fork it, strip it, or replace the policy. You do not need to
 ask. Keep the original copyright notice in copies of the Software.
 
-Suggested local edit points (edit source, never generated artifacts):
+Suggested local edit points:
 
 | Want | File |
 |---|---|
-| Change which model + effort Jev may pick | `server/routing_policy.py` — `TIERS`, `EFFORTS`, `MODEL_PROFILES`, `QUESTIONS` |
-| Bump the logged policy id after a real change | `POLICY_VERSION` in the same file |
-| Swap Codex-dry substitutes / effort mapping | tandem tables inside `server/jev_server.py` |
-| Change fail-open, kill switch, or shadow behavior | sentinels documented in Operations |
-| Recalibrate after you change the contract | `python3 server/report_routing.py --days 7` on your own `jev-router-live.jsonl` |
+| Change model + effort choices | `server/routing_policy.py` |
+| Change session/repo guardrails | `server/smart_context.py` |
+| Bump the logged policy id | `POLICY_VERSION` in `server/routing_policy.py` |
+| Swap Codex-dry substitutes | tandem tables in `server/jev_server.py` |
+| Recalibrate after changes | `python3 server/report_routing.py --days 7` |
 
-Do not reuse a replay cache built under another `POLICY_VERSION`. A valid Jev
-choice is applied as-is; if you add keyword rules or a preferred-model bias,
-that is your fork, not this policy.
+Do not reuse a replay cache built under another `POLICY_VERSION`.
 
 Upstream origin: [0xNatoshi/jev-codex-router](https://github.com/0xNatoshi/jev-codex-router).
-PRs back here are welcome; a private fork with a different tandem is also fine.
 
 ## License
 

@@ -16,6 +16,27 @@ LOGDIR="$HOME/Library/Logs"
 [ -x "$PYTHON" ] || { echo "python3 not found"; exit 1; }
 mkdir -p "$LOGDIR"
 
+# launchd does not inherit an interactive shell's TYPESAFE_API_KEY. Keep the
+# secret in an owner-readable env file instead; JEV_ENV_FILE itself is only a
+# path and is safe to persist in the plist.
+DEFAULT_KEY_FILE="$HOME/.hermes/.env"
+OVERRIDE_KEY_FILE="${JEV_ENV_FILE:-}"
+if [ -n "$OVERRIDE_KEY_FILE" ]; then
+  KEY_FILE="$OVERRIDE_KEY_FILE"
+elif [ -r "$DEFAULT_KEY_FILE" ]; then
+  KEY_FILE="$DEFAULT_KEY_FILE"
+else
+  KEY_FILE="$HOME/.jev.env"
+fi
+if [ ! -r "$KEY_FILE" ]; then
+  echo "TypeSafe key file not found."
+  echo "Create $DEFAULT_KEY_FILE containing:"
+  echo "  TYPESAFE_API_KEY=..."
+  echo "or run with JEV_ENV_FILE=/path/to/env."
+  exit 1
+fi
+chmod 600 "$KEY_FILE" 2>/dev/null || true
+
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -36,6 +57,23 @@ cat > "$PLIST" <<EOF
 </plist>
 EOF
 
+if [ -n "${JEV_ENV_FILE:-}" ]; then
+  JEV_ENV_FILE="$JEV_ENV_FILE" "$PYTHON" - "$PLIST" <<'PY'
+import os
+import plistlib
+import sys
+
+path = sys.argv[1]
+with open(path, "rb") as fh:
+    plist = plistlib.load(fh)
+plist["EnvironmentVariables"] = {
+    "JEV_ENV_FILE": os.path.realpath(os.path.expanduser(os.environ["JEV_ENV_FILE"]))
+}
+with open(path, "wb") as fh:
+    plistlib.dump(plist, fh, sort_keys=False)
+PY
+fi
+
 # Replace any existing instance (watchdog / former label) with the service.
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 rm -f "$HOME/Library/LaunchAgents/io.0xnatoshi.jev-router.plist"
@@ -47,5 +85,20 @@ sleep 1.5
 if curl -s -m 5 http://127.0.0.1:4319/health; then
   echo ""
   echo "— Jev Router service OK ($LABEL)"
+else
+  echo "Jev Router did not answer /health; inspect $LOGDIR/jev-router.err.log"
+  exit 1
 fi
+
+echo ""
+echo "Running end-to-end readiness checks (TypeSafe + caller secret + Codex Router)..."
+"$PYTHON" "$REPO/server/jev_server.py" --check || {
+  echo ""
+  echo "Service is installed, but one or more prerequisites are not ready."
+  echo "Fix the failed check above, then run:"
+  echo "  $PYTHON $REPO/server/jev_server.py --check"
+  exit 1
+}
+
+echo ""
 echo "Uninstall: launchctl bootout gui/\$(id -u)/$LABEL"

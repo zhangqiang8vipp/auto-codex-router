@@ -16,6 +16,68 @@ from unittest import mock
 import jev_server as jev
 
 
+class KeyLoading(unittest.TestCase):
+    def test_explicit_env_file_wins_without_exposing_the_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "jev.env")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("TYPESAFE_API_KEY=file-secret\n")
+            with mock.patch.dict(os.environ, {
+                "JEV_ENV_FILE": path,
+                "TYPESAFE_API_KEY": "process-secret",
+            }, clear=False):
+                self.assertEqual(jev.key_paths()[0], os.path.realpath(path))
+                self.assertEqual(jev.load_key(), "file-secret")
+
+    def test_process_env_is_last_resort(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "missing.env")
+            with mock.patch.object(jev, "ENV_PATH", missing), \
+                 mock.patch.object(jev, "LEGACY_ENV_PATH", missing + ".legacy"), \
+                 mock.patch.dict(os.environ, {
+                     "JEV_ENV_FILE": missing + ".override",
+                     "TYPESAFE_API_KEY": "process-secret",
+                 }, clear=False):
+                self.assertEqual(jev.load_key(), "process-secret")
+
+
+class InstallationCheck(unittest.TestCase):
+    class FakeResponse:
+        status = 200
+
+        def read(self, _size=None):
+            return b'{"ok":true}'
+
+    class FakeConnection:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def request(self, *_args, **_kwargs):
+            pass
+
+        def getresponse(self):
+            return InstallationCheck.FakeResponse()
+
+        def close(self):
+            pass
+
+    def test_check_verifies_dependencies_without_exposing_secrets(self):
+        with mock.patch.object(jev, "load_key", return_value="typesafe-secret"), \
+             mock.patch.object(jev, "call_jev_routed",
+                               return_value={"answers": {"ready": {"probability": 1.0}}}), \
+             mock.patch.object(jev, "caller_secret", return_value="caller-secret"), \
+             mock.patch.object(jev.http.client, "HTTPConnection", self.FakeConnection):
+            result = jev.installation_check()
+        self.assertTrue(result["ok"])
+        encoded = json.dumps(result)
+        self.assertNotIn("typesafe-secret", encoded)
+        self.assertNotIn("caller-secret", encoded)
+        self.assertEqual(
+            [item["name"] for item in result["checks"]],
+            ["typesafe_key", "typesafe_api", "caller_secret", "codex_router"],
+        )
+
+
 class ResponseIdContinuity(unittest.TestCase):
     """One response id per relayed stream, however many gateways touched it.
 
