@@ -1312,6 +1312,18 @@ class Handler(BaseHTTPRequestHandler):
                         out_ctype = "application/json"
                 if status != 200 and stream_requested:
                     out_kind = "json"
+                    # Rewrite upstream error to match OpenAI native format so Codex
+                    # shows the friendly usage-limit message instead of retrying.
+                    try:
+                        parsed = json.loads(data.decode("utf-8", "replace"))
+                        inner = parsed.get("error", parsed) if isinstance(parsed, dict) else {}
+                    except (ValueError, UnicodeDecodeError):
+                        inner = {}
+                    if status == 429:
+                        inner["type"] = "rate_limit_error"
+                        inner["code"] = "rate_limit_exceeded"
+                        inner.setdefault("message", "You have hit your rate limit. Check your workspace usage settings to continue.")
+                    data = json.dumps({"error": inner}).encode("utf-8")
                     self.send_response(status)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(data)))
