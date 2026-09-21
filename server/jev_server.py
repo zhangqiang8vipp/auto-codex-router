@@ -560,6 +560,7 @@ _BREAKER = {}            # model -> (fail_count, first_fail_ts, open_until, prob
 _BREAKER_LOCK = threading.Lock()
 _BREAKER_THRESHOLD = 2   # consecutive failures before opening
 _BREAKER_OPEN_S = 60.0   # how long a model is skipped
+RETRYABLE_UPSTREAM = frozenset({429, 500, 502, 503, 504})
 
 
 def _breaker_unpack(entry):
@@ -635,6 +636,20 @@ def breaker_pick(preferred_model):
         if breaker_available(candidate):
             return candidate, candidate != preferred_model
     return None, True
+
+
+def breaker_finish(model, status, quota_hit=False):
+    """Finish a claimed circuit slot based only on model-health evidence."""
+    if quota_hit:
+        breaker_release(model)
+    elif status == 200:
+        breaker_record(model, True)
+    elif status in RETRYABLE_UPSTREAM:
+        breaker_record(model, False)
+    else:
+        # Request-specific 4xx/protocol rejections do not prove the physical
+        # model is unhealthy, and must not strand a half-open probe.
+        breaker_release(model)
 
 
 def validate_ask(body):
@@ -1325,11 +1340,21 @@ class Handler(BaseHTTPRequestHandler):
         # Mutating native redirect while it is temporarily held would make an
         # OFF click look successful and then be undone when the forward exits.
         # Fail explicitly; the UI can retry after the in-flight turn completes.
-        if native_redirect_suppression_active():
+        # Make the idle check and redirect mutation atomic against a new
+        # suppression starting in another request. Holding this lock across the
+        # control subprocess is acceptable: Auto toggles are rare, while routed
+        # forwards only need the lock for their short file transition.
+        busy = False
+        with _NATIVE_REDIRECT_LOCK:
+            if _NATIVE_REDIRECT_DEPTH > 0:
+                busy = True
+                result = None
+            else:
+                result = set_auto_enabled(STATE, CODEX_ROUTER_DIR, body["enabled"])
+        if busy:
             payload = self._auto_status()
             payload["error"] = "routing request in flight; retry Auto toggle shortly"
             return self._json(503, payload)
-        result = set_auto_enabled(STATE, CODEX_ROUTER_DIR, body["enabled"])
         payload = result.as_dict()
         payload["route"] = last_route_status() or None
         payload["policy_version"] = POLICY_VERSION
@@ -1563,7 +1588,6 @@ class Handler(BaseHTTPRequestHandler):
 
         out_path = path if path.startswith("/v1") else "/v1" + path
         self._attempts = []
-        RETRYABLE_UPSTREAM = {429, 500, 502, 503, 504}
         # Hard wall-clock budget for the whole tier-escalation sequence.
         ESCALATION_DEADLINE = 75.0
         escalation_deadline = time.monotonic() + ESCALATION_DEADLINE
@@ -1618,10 +1642,7 @@ class Handler(BaseHTTPRequestHandler):
                 # Terminal subscription exhaustion is carried to Codex as a
                 # response.failed SSE. It is handled, not a healthy upstream
                 # success and not a reason to probe another tier.
-                if quota_hit:
-                    breaker_release(attempt_model)
-                else:
-                    breaker_record(attempt_model, status == 200)
+                breaker_finish(attempt_model, status, quota_hit)
                 if status == 200:
                     break
 
@@ -1656,12 +1677,19 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 apply_route(payload, model, effort)
                 with native_redirect_suppressed():
-                    status, out_kind, ctype, quota_hit, _u, _r, error_bytes = self._forward(
-                        payload, out_path, stream_requested, debug, marker, model, signature)
-                if quota_hit:
-                    breaker_release(model)
-                else:
-                    breaker_record(model, status == 200)
+                    try:
+                        status, out_kind, ctype, quota_hit, _u, _r, error_bytes = self._forward(
+                            payload, out_path, stream_requested, debug, marker, model, signature)
+                    except (BrokenPipeError, ConnectionResetError):
+                        breaker_release(model)
+                        raise
+                    except ResponseCommittedError:
+                        breaker_record(model, False)
+                        raise
+                    except (http.client.HTTPException, ConnectionError, OSError):
+                        breaker_record(model, False)
+                        raise
+                breaker_finish(model, status, quota_hit)
 
         retried = False
         fallback = None
@@ -1866,6 +1894,12 @@ class Handler(BaseHTTPRequestHandler):
                         data = json.dumps(assembled).encode("utf-8")
                         out_ctype = "application/json"
                 quota_error = terminal_quota_error(status, resp.headers, data)
+                if quota_error is not None:
+                    # Account/workspace exhaustion is terminal but not evidence
+                    # that this physical tier is unhealthy. Streaming callers
+                    # get the native-looking response.failed envelope below;
+                    # non-stream callers keep the upstream HTTP error verbatim.
+                    quota_hit = True
                 if quota_error is not None and stream_requested:
                     # Terminal ChatGPT subscription/quota exhaustion: return a
                     # 200 SSE response.failed so Codex shows the native
