@@ -24,6 +24,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 
 PATCHED_CONDITION = "if (!registeredRoute && requestedModel && !exactRouteProbe) {"
@@ -377,20 +378,41 @@ def write_marker(state_dir: Path, router_path: Path, sha256: str) -> None:
             pass
 
 
-def restart_router(router_dir: Path) -> None:
+ROUTER_LOG_MAX_BYTES = 50 * 1024 * 1024
+
+
+def _archive_router_log(state_dir: Path) -> None:
+    """Rename an oversized router.log; called while no Node process holds it."""
+    router_log = state_dir / "router.log"
+    try:
+        if router_log.exists() and router_log.stat().st_size > ROUTER_LOG_MAX_BYTES:
+            archive = state_dir / "router.log.archive"
+            if archive.exists():
+                archive.unlink()
+            os.replace(router_log, archive)
+    except OSError:
+        pass
+
+
+def restart_router(router_dir: Path, state_dir: Path) -> None:
     node = shutil.which("node") or shutil.which("node.exe")
     if not node:
         raise PatchError("Node.js was not found; Codex Router cannot be restarted.")
     service = router_dir / "src" / "service.mjs"
     if not service.is_file():
         raise PatchError(f"Codex Router service entrypoint not found: {service}")
+    # Stop Node so it releases router.log, archive the oversized file, then
+    # start Node: it recreates a fresh router.log.
+    subprocess.run([node, str(service), "stop"], cwd=str(router_dir), check=False)
+    time.sleep(1.5)
+    _archive_router_log(state_dir)
     result = subprocess.run(
-        [node, str(service), "restart"],
+        [node, str(service), "start"],
         cwd=str(router_dir),
         check=False,
     )
     if result.returncode != 0:
-        raise PatchError(f"Codex Router service restart failed with status {result.returncode}.")
+        raise PatchError(f"Codex Router service start failed with status {result.returncode}.")
 
 
 def ensure_patch(router_dir: Path, state_dir: Path, restart: bool) -> dict:
@@ -402,7 +424,7 @@ def ensure_patch(router_dir: Path, state_dir: Path, restart: bool) -> dict:
     # A changed source or an unarmed pre-existing patch must be loaded by the
     # running Node service before Jev is allowed to skip the legacy suppression.
     if restart and (changed or not armed):
-        restart_router(router_dir)
+        restart_router(router_dir, state_dir)
         write_marker(state_dir, router_path, sha256)
         restarted = True
         armed = True
