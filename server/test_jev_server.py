@@ -481,6 +481,32 @@ class ResponseIdContinuity(unittest.TestCase):
         self.assertEqual(self.response_ids(stream), ["resp_alone"])
 
 
+class PerTurnSignature(unittest.TestCase):
+    SIG = "**🌍 terra · thinking: medium**\n\n"
+
+    def test_sign_sets_flag_and_prefixes(self):
+        m = jev.SummaryMarker("", self.SIG)
+        self.assertTrue(m._sign("hello").startswith(self.SIG))
+        self.assertTrue(m.did_sign)
+
+    def test_already_prefixed_is_not_resigned(self):
+        m = jev.SummaryMarker("", self.SIG)
+        self.assertEqual(m._sign(self.SIG + "hello"), self.SIG + "hello")
+        self.assertFalse(m.did_sign)
+
+    def test_without_signature_flag_stays_false(self):
+        m = jev.SummaryMarker("")
+        self.assertEqual(m._sign("hello"), "hello")
+        self.assertFalse(m.did_sign)
+
+    def test_message_item_gets_one_prefixed_text_part(self):
+        item = {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]}
+        m = jev.SummaryMarker("", self.SIG)
+        m._sign_message_item(item)
+        self.assertTrue(item["content"][0]["text"].startswith(self.SIG))
+        self.assertTrue(m.did_sign)
+
 class Policy(unittest.TestCase):
     def test_a_low_confidence_user_turn_keeps_the_jev_choice(self):
         model, effort, speed, gate = jev.route(jev.LUNA, "low", 0.1, {"step_type": "user_turn"})

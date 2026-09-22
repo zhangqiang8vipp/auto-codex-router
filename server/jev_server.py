@@ -1256,6 +1256,7 @@ class SummaryMarker:
         self._response_id = None  # the id this stream's completion must repeat
         self.usage = None
         self.terminal_type = None
+        self.did_sign = False
 
     @staticmethod
     def _emit(lines):
@@ -1294,7 +1295,10 @@ class SummaryMarker:
         """Prefix a full text representation once, preserving an empty output."""
         if not self.signature or not isinstance(value, str) or not value:
             return value
-        return value if value.startswith(self.signature) else self.signature + value
+        if value.startswith(self.signature):
+            return value
+        self.did_sign = True
+        return self.signature + value
 
     @staticmethod
     def _message_key(data):
@@ -1910,7 +1914,9 @@ class Handler(BaseHTTPRequestHandler):
         # breaker reroutes, and operational fallbacks.
         shown = {"model": model, "effort": effort or (payload.get("reasoning") or {}).get("effort")}
         marker = route_marker(shown["model"], shown["effort"])
-        signature = answer_signature(shown)
+        _sign_session = SESSION_STORE.get(thread_key) if thread_key else None
+        _turn_signed = bool(_sign_session) and _sign_session.get("signed_turn_key") == active_turn_key
+        signature = None if _turn_signed else answer_signature(shown)
 
         def apply_route(payload, model, effort):
             payload["model"] = model
@@ -1962,7 +1968,7 @@ class Handler(BaseHTTPRequestHandler):
                 quota_hit = False
                 with concrete_native_forward():
                     try:
-                        status, out_kind, ctype, quota_hit, _u, _r, error_bytes = self._forward(
+                        status, out_kind, ctype, quota_hit, _u, signed_now, error_bytes = self._forward(
                             payload, out_path, stream_requested, debug, marker,
                             attempt_model, signature, deadline=escalation_deadline)
                     except (BrokenPipeError, ConnectionResetError):
@@ -1977,6 +1983,9 @@ class Handler(BaseHTTPRequestHandler):
                             self._attempts[-1]["status"] = status
                         error_bytes = json.dumps({"error": {"type": "server_error",
                             "message": f"router connection failed: {exc}"}}).encode("utf-8")
+
+                if signed_now and thread_key:
+                    SESSION_STORE.put(thread_key, signed_turn_key=active_turn_key)
 
                 # Terminal subscription exhaustion is carried to Codex through
                 # the native-quota transport (canonical HTTP 429 when the
@@ -2021,7 +2030,7 @@ class Handler(BaseHTTPRequestHandler):
                 apply_route(payload, model, effort)
                 with concrete_native_forward():
                     try:
-                        status, out_kind, ctype, quota_hit, _u, _r, error_bytes = self._forward(
+                        status, out_kind, ctype, quota_hit, _u, signed_now, error_bytes = self._forward(
                             payload, out_path, stream_requested, debug, marker, model, signature)
                     except (BrokenPipeError, ConnectionResetError):
                         breaker_release(model)
@@ -2032,6 +2041,8 @@ class Handler(BaseHTTPRequestHandler):
                     except (http.client.HTTPException, ConnectionError, OSError):
                         breaker_record(model, False)
                         raise
+                if signed_now and thread_key:
+                    SESSION_STORE.put(thread_key, signed_turn_key=active_turn_key)
                 breaker_finish(model, status, quota_hit)
 
         retried = False
@@ -2179,6 +2190,7 @@ class Handler(BaseHTTPRequestHandler):
                    "terminal_type": None, "usage": None}
         self._attempts.append(attempt)
         markerer = None
+        signed_now = False
         cap = None
         response_started = False
         quota_hit = False
@@ -2254,6 +2266,7 @@ class Handler(BaseHTTPRequestHandler):
                 if piece:
                     self.wfile.write(f"{len(piece):X}\r\n".encode("ascii") + piece + b"\r\n")
                     self.wfile.flush()
+                signed_now = markerer.did_sign
                 if markerer.terminal_type is None:
                     raise ResponseCommittedError(
                         "upstream SSE ended without a terminal Responses event")
@@ -2279,6 +2292,7 @@ class Handler(BaseHTTPRequestHandler):
                         headerer = SummaryMarker("", signature)
                         for item in assembled.get("output") or []:
                             headerer._sign_message_item(item)
+                        signed_now = headerer.did_sign
                         data = json.dumps(assembled).encode("utf-8")
                         out_ctype = "application/json"
                 quota_error = terminal_quota_error(status, resp.headers, data)
@@ -2336,7 +2350,7 @@ class Handler(BaseHTTPRequestHandler):
                         self.send_header("Content-Length", str(len(data)))
                         self.end_headers()
                         self.wfile.write(data)
-            return status, out_kind, ctype, quota_hit, None, None, error_bytes
+            return status, out_kind, ctype, quota_hit, None, signed_now, error_bytes
         except (BrokenPipeError, ConnectionResetError):
             raise
         except ResponseCommittedError:
