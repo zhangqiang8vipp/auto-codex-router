@@ -58,7 +58,9 @@ Jev never substitutes a third-party model.
 import base64
 import codecs
 import contextlib
+import gzip
 import hashlib
+import shutil
 import http.client
 import json
 import os
@@ -98,6 +100,10 @@ DEBUG_PATH = os.path.join(STATE, "jev-router.debug")
 SIGNATURE_PATH = os.path.join(STATE, "jev-router.signature")
 LOG_PATH = os.path.join(STATE, "jev-router-live.jsonl")
 LOG_MAX_BYTES = 20 * 1024 * 1024
+LOG_ARCHIVE_DIR = os.path.join(STATE, "logs", "archive")
+LOG_ARCHIVE_RETAIN_DAYS = 30
+LOG_ARCHIVE_MAX_BYTES = 200 * 1024 * 1024
+LOG_ARCHIVE_KEEP_SEGMENTS = 30
 SHADOW_EVAL_PATH = os.path.join(STATE, "jev-shadow-eval.jsonl")
 SESSION_PATH = os.path.join(STATE, "jev-router-sessions.json")
 SESSION_STORE = SessionStore(SESSION_PATH)
@@ -1539,14 +1545,47 @@ def assemble_sse(raw):
     return None
 
 
+def _archive_log_segment(path):
+    """Gzip the sealed live log into a timestamped, non-destructive segment."""
+    os.makedirs(LOG_ARCHIVE_DIR, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(LOG_ARCHIVE_DIR, f"jev-router-live-{stamp}.jsonl.gz")
+    n = 1
+    while os.path.exists(dest):
+        dest = os.path.join(LOG_ARCHIVE_DIR, f"jev-router-live-{stamp}-{n}.jsonl.gz")
+        n += 1
+    with open(path, "rb") as src, gzip.open(dest, "wb") as out:
+        shutil.copyfileobj(src, out)
+    return dest
+
+
+def _prune_log_archives():
+    """Retention: drop only the OLDEST segments beyond the age/size budget."""
+    try:
+        segs = [os.path.join(LOG_ARCHIVE_DIR, f) for f in os.listdir(LOG_ARCHIVE_DIR)
+                if f.endswith(".jsonl.gz")]
+        segs.sort(key=lambda item: os.path.getmtime(item))
+        now = time.time()
+        for item in list(segs):
+            if now - os.path.getmtime(item) > LOG_ARCHIVE_RETAIN_DAYS * 86400:
+                os.remove(item)
+                segs.remove(item)
+        def total():
+            return sum(os.path.getsize(item) for item in segs)
+        while segs and (len(segs) > LOG_ARCHIVE_KEEP_SEGMENTS
+                        or total() > LOG_ARCHIVE_MAX_BYTES):
+            os.remove(segs.pop(0))
+    except OSError:
+        pass
+
+
 def _rotate_log_if_needed(path):
-    """Size-bounded rotation: keep one .1 backup so logs cannot grow unbounded."""
+    """Seal the bounded live log into the distillation corpus, then reset it."""
     try:
         if os.path.exists(path) and os.path.getsize(path) >= LOG_MAX_BYTES:
-            backup = path + ".1"
-            if os.path.exists(backup):
-                os.remove(backup)
-            os.replace(path, backup)
+            _archive_log_segment(path)
+            os.remove(path)
+            _prune_log_archives()
     except OSError:
         pass
 

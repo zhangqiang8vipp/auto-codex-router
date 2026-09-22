@@ -259,6 +259,7 @@ class RepoProfiler:
             timeout=self.timeout_s,
             check=False,
             env=env,
+            creationflags=(0x08000000 if os.name == "nt" else 0),
         )
         return proc.stdout.strip() if proc.returncode == 0 else ""
 

@@ -520,22 +520,27 @@ class PerTurnSignature(unittest.TestCase):
         self.assertEqual(jev.HEADER_RX.sub("", hdr), "")
 
 class LogRotation(unittest.TestCase):
-    def test_rotates_after_size_cap_and_keeps_one_backup(self):
+    def test_seals_compressed_archive_segment_and_resets_live(self):
+        import gzip
         with tempfile.TemporaryDirectory() as d:
             live = os.path.join(d, "live.jsonl")
-            with mock.patch.object(jev, "LOG_PATH", live), mock.patch.object(jev, "LOG_MAX_BYTES", 120):
+            arch = os.path.join(d, "archive")
+            with mock.patch.object(jev, "LOG_PATH", live), mock.patch.object(jev, "LOG_MAX_BYTES", 120), mock.patch.object(jev, "LOG_ARCHIVE_DIR", arch):
                 for i in range(20):
                     jev.log_line({"i": i, "pad": "x"*40})
-            self.assertTrue(os.path.exists(live))
-            self.assertTrue(os.path.exists(live + ".1"))
+            segs = [f for f in os.listdir(arch) if f.endswith(".jsonl.gz")]
+            self.assertTrue(segs)
+            blob = b"".join(gzip.open(os.path.join(arch, f)).read() for f in segs).decode()
+            self.assertIn('"i": 0', blob)
             self.assertNotIn('"i": 0', open(live, encoding="utf-8").read())
 
     def test_no_rotation_under_cap(self):
         with tempfile.TemporaryDirectory() as d:
             live = os.path.join(d, "live.jsonl")
-            with mock.patch.object(jev, "LOG_PATH", live), mock.patch.object(jev, "LOG_MAX_BYTES", 10**9):
+            arch = os.path.join(d, "archive")
+            with mock.patch.object(jev, "LOG_PATH", live), mock.patch.object(jev, "LOG_MAX_BYTES", 10**9), mock.patch.object(jev, "LOG_ARCHIVE_DIR", arch):
                 jev.log_line({"a": 1})
-            self.assertFalse(os.path.exists(live + ".1"))
+            self.assertFalse(os.path.exists(arch))
 
 
 class Policy(unittest.TestCase):

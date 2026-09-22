@@ -403,13 +403,15 @@ def restart_router(router_dir: Path, state_dir: Path) -> None:
         raise PatchError(f"Codex Router service entrypoint not found: {service}")
     # Stop Node so it releases router.log, archive the oversized file, then
     # start Node: it recreates a fresh router.log.
-    subprocess.run([node, str(service), "stop"], cwd=str(router_dir), check=False)
+    subprocess.run([node, str(service), "stop"], cwd=str(router_dir), check=False,
+                   creationflags=(0x08000000 if os.name == "nt" else 0))
     time.sleep(1.5)
     _archive_router_log(state_dir)
     result = subprocess.run(
         [node, str(service), "start"],
         cwd=str(router_dir),
         check=False,
+        creationflags=(0x08000000 if os.name == "nt" else 0),
     )
     if result.returncode != 0:
         raise PatchError(f"Codex Router service start failed with status {result.returncode}.")
