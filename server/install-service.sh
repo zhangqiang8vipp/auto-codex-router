@@ -3,7 +3,7 @@
 # Run ONCE by the user, from THEIR Terminal (launchctl is deliberately
 # restricted inside supervised agents).
 #
-#   bash ~/Documents/Github/jev-codex-router/server/install-service.sh
+#   bash ~/Documents/Github/auto-codex-router/server/install-service.sh
 #
 set -e
 

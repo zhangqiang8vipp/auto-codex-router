@@ -73,6 +73,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import counters
 import logrotate
+import web_panel
 from auto_control import set_enabled as set_auto_enabled
 from auto_control import status as auto_status
 from route_lease import (RouteLeaseLocks, apply_failure_escalation,
@@ -142,7 +143,7 @@ LISTEN = ("127.0.0.1", _port_from_env("JEV_ROUTER_PORT", default=4319))
 ROUTER = ("127.0.0.1", _port_from_env(
     "MODEL_ROUTER_PORT", "CODEX_ROUTER_PORT", default=4202))
 
-DISPLAY_NAME = "Jev Codex Router"
+DISPLAY_NAME = "Auto Codex Router"
 VERSION = "1.8"
 VIRTUAL_MODEL_ID = "auto"
 VIRTUAL_MODEL_SLUG = "jev/auto"
@@ -276,7 +277,8 @@ class _RouteFlight:
         self.error = None
 
 
-def update_last_route_status(model, effort, gate, at):
+def update_last_route_status(model, effort, gate, at, source=None,
+                             lease_action=None, lease_reason=None, status=None):
     with _route_status_lock:
         _last_route_status.clear()
         _last_route_status.update({
@@ -284,6 +286,10 @@ def update_last_route_status(model, effort, gate, at):
             "effort": effort,
             "gate": gate,
             "at": at,
+            "source": source,
+            "lease_action": lease_action,
+            "lease_reason": lease_reason,
+            "status": status,
         })
 
 
@@ -1593,6 +1599,15 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _html(self, code, text):
+        data = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _auto_status(self):
         snapshot = auto_status(STATE, CODEX_ROUTER_DIR).as_dict()
         # Suppression temporarily moves the redirect file out of the normal
@@ -1683,7 +1698,8 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def do_GET(self):
-        path = self.path.split("?", 1)[0].rstrip("/")
+        raw_path = self.path.split("?", 1)[0]
+        path = raw_path.rstrip("/")
         if path in ("/v1/models", "/models"):
             self._json(200, {
                 "object": "list",
@@ -1705,10 +1721,14 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path in ("/control/status", "/v1/control/status"):
             self._json(200, self._auto_status())
-        elif path in ("/health", ""):
+        elif path in web_panel.RECENT_PATHS:
+            self._json(200, {"records": web_panel.recent_records(LOG_PATH)})
+        elif path == "/health":
             self._json(200, {"ok": True, "service": "jev-router", "version": VERSION,
                              "policy_version": POLICY_VERSION,
                              "auto": self._auto_status()["auto"]})
+        elif raw_path in web_panel.PANEL_PATH_TOKENS:
+            self._html(200, web_panel.PANEL_HTML)
         else:
             self._json(404, {"error": {"message": "not found"}})
 
@@ -2178,7 +2198,11 @@ class Handler(BaseHTTPRequestHandler):
             "task": task[:110],
         })
         COUNTERS.record(route_source, jev_cache)
-        update_last_route_status(model, effort, gate, finished_at)
+        update_last_route_status(
+            model, effort, gate, finished_at,
+            source=route_source, lease_action=lease_action,
+            lease_reason=lease_reason, status=status,
+        )
         append_shadow_event(
             SHADOW_EVAL_PATH,
             build_turn_event(

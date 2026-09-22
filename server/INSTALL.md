@@ -13,7 +13,7 @@ shared ChatGPT session.
 Recommended bootstrap (install or update):
 
 ```powershell
-irm https://raw.githubusercontent.com/zhangqiang8vipp/jev-codex-router/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/zhangqiang8vipp/auto-codex-router/main/install.ps1 | iex
 ```
 
 It downloads the latest source to
@@ -26,7 +26,7 @@ If Codex Router is not in a standard checkout path:
 
 ```powershell
 $env:CODEX_ROUTER_DIR = "C:\absolute\path\to\codex-router"
-irm https://raw.githubusercontent.com/zhangqiang8vipp/jev-codex-router/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/zhangqiang8vipp/auto-codex-router/main/install.ps1 | iex
 ```
 
 For a checked-out development tree, the lower-level installer remains:

@@ -13,7 +13,7 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
 $RepoOwner = "zhangqiang8vipp"
-$RepoName = "jev-codex-router"
+$RepoName = "auto-codex-router"
 $ArchiveUrl = "https://github.com/$RepoOwner/$RepoName/archive/refs/heads/$Branch.zip"
 $CodexRouterRepositoryUrl = "https://github.com/duolahypercho/codex-router.git"
 
@@ -562,7 +562,7 @@ function Install-SourceTree([string]$Destination) {
   $parent = Split-Path -Parent $Destination
   [void][IO.Directory]::CreateDirectory($parent)
 
-  $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("jev-codex-router-" + [Guid]::NewGuid().ToString("N"))
+  $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ("auto-codex-router-" + [Guid]::NewGuid().ToString("N"))
   $zipPath = Join-Path $tempRoot "source.zip"
   $extractPath = Join-Path $tempRoot "extract"
   $backupPath = "$Destination.previous"
