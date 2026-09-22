@@ -63,5 +63,17 @@ class LogRotate(unittest.TestCase):
                 [f for f in os.listdir(arch) if f.endswith(".jsonl.gz")])
 
 
+    def test_manifest_indexes_segments(self):
+        with tempfile.TemporaryDirectory() as d:
+            live = os.path.join(d, "live.jsonl")
+            arch = os.path.join(d, "a")
+            _write_jsonl(live, 7)
+            logrotate.rotate_if_needed(live, 50, arch, "p")
+            import json as j
+            manifest = j.load(open(os.path.join(arch, "MANIFEST.json"), encoding="utf-8") )
+            seg = list(manifest["segments"])[0]
+            self.assertEqual(manifest["segments"][seg]["records"], 7)
+
+
 if __name__ == "__main__":
     unittest.main()

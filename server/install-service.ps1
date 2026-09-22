@@ -189,8 +189,8 @@ $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $logon = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
 $heartbeatParams = @{
   Once = $true
-  At = (Get-Date).AddMinutes(1)
-  RepetitionInterval = (New-TimeSpan -Minutes 1)
+  At = (Get-Date).AddMinutes(15)
+  RepetitionInterval = (New-TimeSpan -Minutes 15)
   RepetitionDuration = (New-TimeSpan -Days 3650)
 }
 $heartbeat = New-ScheduledTaskTrigger @heartbeatParams
