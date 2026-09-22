@@ -16,6 +16,8 @@ import os
 import threading
 import uuid
 
+from logrotate import rotate_if_needed
+
 SCHEMA_VERSION = 2
 USAGE_FIELDS = (
     "input_tokens",
@@ -193,10 +195,12 @@ def build_tool_feedback(*, at, turn_id, session, errored):
     }
 
 
-def append_event(path, event):
+def append_event(path, event, rotation=None):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with _lock:
+            if rotation is not None:
+                rotate_if_needed(path, **rotation)
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
         try:
