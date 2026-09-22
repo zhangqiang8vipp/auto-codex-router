@@ -223,7 +223,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
           </dl>
         </div>
         <div class="card full">
-          <h2 data-i18n="ov.today">Today <span class="muted" id="todayDate"></span></h2>
+          <h2><span data-i18n="ov.today">Today</span> <span class="muted" id="todayDate"></span></h2>
           <div class="statrow">
             <div class="stat"><b id="sTotal">0</b><span data-i18n="ov.stTotal">Total</span></div>
             <div class="stat"><b id="sJev">0</b><span data-i18n="ov.stJev">Decisions</span></div>
@@ -360,7 +360,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "page.activity":"实时活动","page.keys":"密钥"}
   };
   var lang=(navigator.language||"en").toLowerCase().indexOf("zh")===0?"zh":"en";
-  var catalog=null,status=null,busy=false;
+  var catalog=null,status=null,busy=false,recentRows=null;
   function $(id){return document.getElementById(id);}
   function t(k){var s=STR[lang][k];return s===undefined?k:s;}
   function esc(s){return String(s==null?"":s).replace(/[&<>]/g,function(c)
@@ -372,6 +372,39 @@ PANEL_HTML = r'''<!DOCTYPE html>
   var SOURCE_EN={jev:"Jev decision",lease:"Lease reuse",lease_escalation:"Escalation",
     fallback:"Fallback",jev_error_fallback:"Error fallback",off:"Off"};
   function sourceLabel(s){return (lang==="zh"?SOURCE_ZH:SOURCE_EN)[s]||s||"—";}
+
+  var TIER_PROFILE_ZH={
+    "gpt-5.6-luna":"成本优化的 GPT-5.6，适合清晰、大量、机械性的工作。",
+    "gpt-5.6-terra":"均衡的 GPT-5.6，适合日常生产级编码与判断。",
+    "gpt-5.6-sol":"更高能力的 GPT-5.6，适合复杂的专业与跨领域工作。",
+    "gpt-6-astra":"最强模型，用于最困难的端到端推理工作。"};
+  var EFFORT_PROFILE_ZH={low:"较小的推理预算。",medium:"适中的推理预算。",
+    high:"充足的推理预算。",xhigh:"更大的推理预算。",max:"支持的最大推理预算。"};
+  var MODEL_DESC_ZH={
+    "gpt-5.6-sol":"日常任务可靠的智能体主力模型。",
+    "gpt-5.6-sol-1m":"最新前沿智能编码模型，运行在其文档所述的 100 万 token 上下文窗口；输入超过 27.2 万 token 的轮次按更高费率计费。",
+    "gpt-5.6-terra":"均衡的智能编码模型，适合日常工作。",
+    "gpt-5.6-luna":"快速、经济的智能编码模型。",
+    "gpt-6-astra":"我们最强的模型，用于复杂、高要求的工作。",
+    "gpt-reserve":"快速、经济的智能编码模型。",
+    "gpt-daybreak-blue-latest":"最新前沿智能编码模型，用于广泛的防御性网络安全工作。",
+    "gpt-daybreak-red-latest":"最新前沿智能编码模型的网络进攻变体，用于高级、经授权的网络安全研究。",
+    "gpt-5.5":"经过验证的上一代模型，用于编码与通用工作。",
+    "gpt-5.4":"适合日常编码的强力模型。",
+    "codex-auto-review":"Codex 的自动审批审查模型。",
+    "jev/auto":"用户策展的 jev 模型；上下文窗口与输入模态以策展时供应商目录所标注的为准。"};
+  var REASON_ZH={no_valid_lease:"无有效租约",same_user_turn_replay:"同一用户轮次重放",
+    new_user_turn:"新用户轮次",tool_continuation:"工具续接",
+    compaction_continuity:"压缩后续接",same_session_continuation:"同会话续接",
+    failure_escalation:"失败后升级"};
+  var REASON_EN={no_valid_lease:"No valid lease",same_user_turn_replay:"Same user turn replay",
+    new_user_turn:"New user turn",tool_continuation:"Tool continuation",
+    compaction_continuity:"Compaction continuity",same_session_continuation:"Same-session continuation",
+    failure_escalation:"Failure escalation"};
+  function txProfile(id,en){return lang==="zh"?(TIER_PROFILE_ZH[id]||en):en;}
+  function effProfile(id,en){return lang==="zh"?(EFFORT_PROFILE_ZH[id]||en):en;}
+  function modelDesc(slug,en){return lang==="zh"?(MODEL_DESC_ZH[slug]||en):en;}
+  function reasonLabel(r){return (lang==="zh"?REASON_ZH:REASON_EN)[r]||r||"—";}
 
   function localize(){
     document.documentElement.lang=lang==="zh"?"zh-CN":"en";
@@ -410,7 +443,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
     $("rModel").textContent=shortModel(r.model);
     $("rEffort").textContent=r.effort||"—";
     $("rSource").textContent=sourceLabel(r.source);
-    $("rWhy").textContent=r.lease_reason||r.gate||"—";
+    $("rWhy").textContent=r.lease_reason?reasonLabel(r.lease_reason):(r.gate||"—");
     $("rAt").textContent=r.at||"—";
     var d=s.today||{};
     $("todayDate").textContent=d.date?("("+d.date+")"):"";
@@ -433,10 +466,10 @@ PANEL_HTML = r'''<!DOCTYPE html>
     // tiers
     $("tierCards").innerHTML=c.tiers.map(function(tx){
       return '<div class="tierc"><span class="rank">#'+tx.rank+'</span><b class="mono">'+
-        esc(tierShort(tx.id))+'</b><p>'+esc(tx.profile)+'</p></div>';}).join("");
+        esc(tierShort(tx.id))+'</b><p>'+esc(txProfile(tx.id,tx.profile))+'</p></div>';}).join("");
     // efforts
     $("effChips").innerHTML=c.efforts.map(function(e){
-      return '<span class="eff mono">'+e.id+'<small>'+esc(e.profile)+'</small></span>';}).join("");
+      return '<span class="eff mono">'+e.id+'<small>'+esc(effProfile(e.id,e.profile))+'</small></span>';}).join("");
     // catalog groups
     var html="";
     c.execution.forEach(function(g){
@@ -450,7 +483,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
         var rb=m.routable?'<span class="pill ok">'+t("md.routable")+'</span>':'<span class="pill no">'+t("md.notroutable")+'</span>';
         var hidden=m.visibility==="hide"?'<span class="pill off">'+t("md.hidden")+'</span>':"";
         return '<div class="mcard"><div class="mh"><b>'+esc(m.name)+'</b>'+rb+hidden+'</div><p>'+
-          esc(m.description)+'</p><div class="mchips">'+chips+'</div></div>';
+          esc(modelDesc(m.slug,m.description))+'</p><div class="mchips">'+chips+'</div></div>';
       }).join("")+'</div></div>';
     });
     $("catalogGroups").innerHTML=html;
@@ -476,6 +509,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
   }
 
   function renderRecent(rows){
+    recentRows=rows;
     var tb=$("actBody");
     if(!rows||!rows.length){tb.innerHTML='<tr><td colspan="5" class="muted">'+t("ac.none")+'</td></tr>';return;}
     tb.innerHTML=rows.slice().reverse().map(function(r){
@@ -485,7 +519,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
         cls+'">'+(r.status==null?"—":r.status)+'</td><td>'+esc(r.task)+'</td></tr>';}).join("");
   }
 
-  function renderAll(){if(status)renderStatus(status);if(catalog)renderCatalog(catalog);}
+  function renderAll(){if(status)renderStatus(status);if(catalog)renderCatalog(catalog);if(recentRows)renderRecent(recentRows);}
 
   function refresh(){
     fetch("/control/status").then(function(r){return r.json();})
