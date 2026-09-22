@@ -114,6 +114,25 @@ if ($exactRouteReady) {
     Out-File -LiteralPath $errLog -Append -Encoding utf8
 }
 
-$argsList = @($python.Prefix) + @($server)
-& $python.Path @argsList 1>> $outLog 2>> $errLog
-exit $LASTEXITCODE
+function Test-JevHealthy {
+  try {
+    $health = Invoke-RestMethod -Uri "http://127.0.0.1:4319/health" -TimeoutSec 2
+    return ($health.ok -eq $true -and $health.service -eq "jev-router")
+  } catch {
+    return $false
+  }
+}
+
+# Supervisor model: if a healthy detached server already exists, do nothing.
+# Otherwise spawn one fully detached (it survives this launcher exiting),
+# hidden and windowless; boot output goes to dedicated boot logs.
+if (Test-JevHealthy) {
+  exit 0
+}
+
+$bootOut = Join-Path $StateDir "jev-server.boot.out.log"
+$bootErr = Join-Path $StateDir "jev-server.boot.err.log"
+$serverArgs = @($python.Prefix) + @("`"$server`"")
+[void](Start-Process -FilePath $python.Path -ArgumentList $serverArgs -WindowStyle Hidden -PassThru `
+  -RedirectStandardOutput $bootOut -RedirectStandardError $bootErr)
+exit 0
