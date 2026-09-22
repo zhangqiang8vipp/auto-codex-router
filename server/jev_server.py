@@ -668,6 +668,25 @@ def recover_native_redirect():
     return False
 
 
+def _discard_stale_held_redirect_locked():
+    """Remove a held redirect left by a crashed process while depth is zero.
+
+    Must be called with _NATIVE_REDIRECT_LOCK held and DEPTH == 0. A held file
+    in that state cannot belong to a live forward; deleting it prevents an OFF
+    toggle from being silently undone by recover_native_redirect() on the next
+    process start.
+    """
+    if _NATIVE_REDIRECT_DEPTH != 0:
+        return False
+    _path, held = _native_redirect_paths()
+    try:
+        os.remove(held)
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
 @contextlib.contextmanager
 def native_redirect_suppressed():
     """Move native-redirect.json aside for one or more concrete forwards.
@@ -1577,6 +1596,8 @@ class Handler(BaseHTTPRequestHandler):
                 result = None
             else:
                 result = set_auto_enabled(STATE, CODEX_ROUTER_DIR, body["enabled"])
+                if not body["enabled"]:
+                    _discard_stale_held_redirect_locked()
         if busy:
             payload = self._auto_status()
             payload["error"] = "routing request in flight; retry Auto toggle shortly"
