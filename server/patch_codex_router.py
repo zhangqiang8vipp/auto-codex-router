@@ -150,6 +150,51 @@ class PatchError(RuntimeError):
     pass
 
 
+# Agent payload relay fallback. The upstream routed-agent normalization calls a
+# decryption relay that posts an `encrypted_content` input part; the public Codex
+# API rejects that part with HTTP 400, which the base router turns into a 502 and
+# Codex shows "reconnecting 5/5". This helper makes that failure non-fatal: it
+# keeps the original item so a native exact-route target processes its own token.
+AGENT_RELAY_HELPER_NAME = "jevNormalizeAgentItem"
+AGENT_RELAY_HOOK_ANCHOR = "async function normalizeRoutedAgentInput(request, input, signal) {"
+AGENT_RELAY_LOOP_REPLACEMENT = (
+    "    output.push(await jevNormalizeAgentItem(request, item, payload, signal));"
+)
+AGENT_RELAY_LOOP_ANCHOR = '''    const plaintext = payload.native
+      ? await relayEncryptedAgentPayload(request, item, payload.content, signal)
+      : payload.content;
+    output.push({
+      ...item,
+      content: [
+        ...item.content.filter((part) => part?.type !== "encrypted_content"),
+        { type: "input_text", text: plaintext },
+      ],
+    });
+'''
+AGENT_RELAY_HELPER = r'''
+async function jevNormalizeAgentItem(request, item, payload, signal) {
+  const toText = (text) => ({
+    ...item,
+    content: [
+      ...item.content.filter((part) => part?.type !== "encrypted_content"),
+      { type: "input_text", text },
+    ],
+  });
+  if (!payload.native) return toText(payload.content);
+  try {
+    const plaintext = await relayEncryptedAgentPayload(request, item, payload.content, signal);
+    return toText(plaintext);
+  } catch {
+    // The decryption relay can be unavailable: the public Codex API rejects an
+    // encrypted_content input part (HTTP 400). Never turn that into a 502. Keep
+    // the original item; a native exact-route target processes its own token,
+    // and a non-native target would have failed regardless of the relay.
+    return item;
+  }
+}
+'''
+
+
 def source_supports_exact_native_route(text: str) -> bool:
     """Whether both managed caller-edge hooks are present."""
     if PATCHED_CONDITION not in text:
@@ -162,7 +207,11 @@ def source_supports_exact_native_route(text: str) -> bool:
         and QUOTA_PASSTHROUGH_SENTINEL in text
         and QUOTA_MARKER in text
     )
-    return exact_ok and quota_ok
+    agent_relay_ok = (
+        AGENT_RELAY_HELPER_NAME in text
+        and AGENT_RELAY_LOOP_REPLACEMENT in text
+    )
+    return exact_ok and quota_ok and agent_relay_ok
 
 
 def patch_router_text(text: str) -> tuple[str, bool]:
@@ -215,6 +264,23 @@ def patch_router_text(text: str) -> tuple[str, bool]:
             raise PatchError("Codex Router routed-failure anchor was not found.")
         insert_at = anchor_at + len(quota_failure_anchor)
         text = text[:insert_at] + quota_block + text[insert_at:]
+        changed = True
+
+    # Agent payload relay fallback: insert the non-fatal helper, then point the
+    # normalization loop at it. Both anchors must match the current upstream.
+    if AGENT_RELAY_HELPER_NAME not in text:
+        hook_at = text.find(AGENT_RELAY_HOOK_ANCHOR)
+        if hook_at < 0:
+            raise PatchError("Codex Router routed-agent normalization anchor was not found.")
+        helper = AGENT_RELAY_HELPER.replace("\n", newline)
+        text = text[:hook_at] + helper + newline + text[hook_at:]
+        changed = True
+
+    if AGENT_RELAY_LOOP_REPLACEMENT not in text:
+        loop_anchor = AGENT_RELAY_LOOP_ANCHOR.replace("\n", newline)
+        if loop_anchor not in text:
+            raise PatchError("Codex Router routed-agent relay loop anchor was not found.")
+        text = text.replace(loop_anchor, AGENT_RELAY_LOOP_REPLACEMENT, 1)
         changed = True
 
     if not source_supports_exact_native_route(text):
