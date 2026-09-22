@@ -14,3 +14,9 @@ __pycache__/
 # Secrets / local env
 .env
 *.secret
+
+# .NET desktop build output
+desktop/**/bin/
+desktop/**/obj/
+[Bb]in/
+[Oo]bj/

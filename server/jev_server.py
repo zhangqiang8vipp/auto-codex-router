@@ -61,6 +61,7 @@ import contextlib
 import gzip
 import hashlib
 import shutil
+import subprocess
 import http.client
 import json
 import os
@@ -70,6 +71,7 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import counters
 import logrotate
 from auto_control import set_enabled as set_auto_enabled
 from auto_control import status as auto_status
@@ -116,6 +118,8 @@ SHADOW_ROTATION = {
 }
 SHADOW_EVAL_PATH = os.path.join(STATE, "jev-shadow-eval.jsonl")
 SESSION_PATH = os.path.join(STATE, "jev-router-sessions.json")
+COUNTERS_PATH = os.path.join(STATE, "counters.json")
+COUNTERS = counters.DailyCounters(COUNTERS_PATH)
 SESSION_STORE = SessionStore(SESSION_PATH)
 ROUTE_LEASE_LOCKS = RouteLeaseLocks()
 REPO_PROFILER = RepoProfiler()
@@ -1602,6 +1606,7 @@ class Handler(BaseHTTPRequestHandler):
         snapshot["route"] = last_route_status() or None
         snapshot["policy_version"] = POLICY_VERSION
         snapshot["exact_native_route"] = exact_native_route_supported()
+        snapshot["today"] = COUNTERS.today()
         return snapshot
 
     def _auto_control(self):
@@ -2172,6 +2177,7 @@ class Handler(BaseHTTPRequestHandler):
             "would": would,
             "task": task[:110],
         })
+        COUNTERS.record(route_source, jev_cache)
         update_last_route_status(model, effort, gate, finished_at)
         append_shadow_event(
             SHADOW_EVAL_PATH,
@@ -2569,14 +2575,79 @@ def print_installation_check(result):
     return 0 if result["ok"] else 1
 
 
+DOCTOR_FIX_HINTS = {
+    "typesafe_key": "set TYPESAFE_API_KEY in ~/.hermes/.env",
+    "typesafe_api": "check network/key; upstream unreachable",
+    "caller_secret": "re-run setup; caller-secret is empty",
+    "codex_router": "start it: node src/service.mjs start",
+    "jev_model": "curate models, then restart Codex Router",
+    "scheduled_task": "re-run server/install-service.ps1",
+}
+
+
+def doctor_report():
+    result = installation_check(require_model=True)
+    checks = result["checks"]
+    state = auto_status(STATE, CODEX_ROUTER_DIR).as_dict()
+    checks.append({
+        "name": "auto_state", "ok": True,
+        "detail": ("ON -> " + str(state.get("redirect_model"))) if state.get("auto") else "OFF"})
+    if os.name == "nt":
+        try:
+            cp = subprocess.run(
+                ["schtasks", "/Query", "/TN", "Jev Codex Router", "/FO", "CSV", "/NH"],
+                capture_output=True, check=False,
+                creationflags=(0x08000000))
+            ok = cp.returncode == 0
+            detail = "registered"
+            if ok and cp.stdout:
+                # schtasks emits the system ANSI codepage, not UTF-8; the CSV is
+                # quoted and may contain commas, so parse it properly.
+                import csv as _csv
+                out = cp.stdout.decode("mbcs", errors="replace")
+                rows = list(_csv.reader(out.splitlines()))
+                if rows and len(rows[0]) > 2:
+                    detail = rows[0][2].strip()
+            err = cp.stderr.decode("mbcs", errors="replace") if cp.stderr else ""
+            checks.append({"name": "scheduled_task", "ok": ok, "detail": detail if ok else err.strip()[:120]})
+        except OSError as exc:
+            checks.append({"name": "scheduled_task", "ok": False, "detail": str(exc)[:120]})
+    today = COUNTERS.today()
+    checks.append({
+        "name": "today_counters", "ok": True,
+        "detail": (f"{today['total']} calls, {today['jev_decisions']} Jev, "
+                   f"{today['jev_saved']} saved, KEEP {today['keep_pct']}%")})
+    try:
+        segs = [f for f in os.listdir(LOG_ARCHIVE_DIR) if f.endswith(".jsonl.gz")]
+        size = sum(os.path.getsize(os.path.join(LOG_ARCHIVE_DIR, f)) for f in segs)
+        checks.append({"name": "log_archive", "ok": True,
+                      "detail": f"{len(segs)} segments, {size // 1024} KB"})
+    except OSError:
+        checks.append({"name": "log_archive", "ok": True, "detail": "no archive yet"})
+    result["checks"] = checks
+    result["ok"] = all(item["ok"] for item in checks)
+    return result
+
+
+def print_doctor(result):
+    print_installation_check(result)
+    for item in result["checks"]:
+        if not item["ok"] and item["name"] in DOCTOR_FIX_HINTS:
+            print(f"  fix[{item['name']}]: {DOCTOR_FIX_HINTS[item['name']]}")
+    print("READY" if result["ok"] else "NEEDS ATTENTION")
+    return 0 if result["ok"] else 1
+
+
 def main(argv=None):
     argv = list(argv if argv is not None else __import__("sys").argv[1:])
     if argv == ["--check"]:
         return print_installation_check(installation_check(require_model=True))
     if argv == ["--check-core"]:
         return print_installation_check(installation_check(require_model=False))
+    if argv == ["--doctor"]:
+        return print_doctor(doctor_report())
     if argv:
-        print("usage: python3 server/jev_server.py [--check|--check-core]", flush=True)
+        print("usage: python3 server/jev_server.py [--check|--check-core|--doctor]", flush=True)
         return 2
 
     server = ThreadingHTTPServer(LISTEN, Handler)
