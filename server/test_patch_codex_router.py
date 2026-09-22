@@ -19,6 +19,26 @@ def upstream_fixture(condition, include_quota_anchor=True):
         if include_quota_anchor
         else ""
     )
+    normalize_fn = (
+        "async function normalizeRoutedAgentInput(request, input, signal) {\n"
+        "  const output = [];\n"
+        "  for (const item of input) {\n"
+        "    const payload = encryptedAgentPayload(item);\n"
+        "    if (!payload) { output.push(item); continue; }\n"
+        "    const plaintext = payload.native\n"
+        "      ? await relayEncryptedAgentPayload(request, item, payload.content, signal)\n"
+        "      : payload.content;\n"
+        "    output.push({\n"
+        "      ...item,\n"
+        "      content: [\n"
+        "        ...item.content.filter((part) => part?.type !== \"encrypted_content\"),\n"
+        "        { type: \"input_text\", text: plaintext },\n"
+        "      ],\n"
+        "    });\n"
+        "  }\n"
+        "  return output;\n"
+        "}\n"
+    )
     return (
         "async function handleResponses(request, response, requestUrl) {\n"
         "  const exactRouteProbe = exactRouteProbeRequested(request.headers);\n"
@@ -33,6 +53,7 @@ def upstream_fixture(condition, include_quota_anchor=True):
         + "    let verdict = classifyRoutedFailure({});\n"
         "  }\n"
         "}\n"
+        + normalize_fn
     )
 
 
@@ -69,6 +90,22 @@ class CodexRouterExactRoutePatch(unittest.TestCase):
         patched, changed = patcher.patch_router_text(original)
         self.assertTrue(changed)
         self.assertTrue(patcher.source_supports_exact_native_route(patched))
+
+    def test_patch_adds_agent_relay_fallback_hook(self):
+        original = upstream_fixture(patcher.ORIGINAL_CONDITION)
+        patched, changed = patcher.patch_router_text(original)
+        self.assertTrue(changed)
+        self.assertIn(patcher.AGENT_RELAY_HELPER_NAME, patched)
+        self.assertIn(patcher.AGENT_RELAY_LOOP_REPLACEMENT, patched)
+        self.assertNotIn("const plaintext = payload.native", patched)
+        self.assertTrue(patcher.source_supports_exact_native_route(patched))
+
+    def test_agent_relay_fallback_is_idempotent(self):
+        original = upstream_fixture(patcher.ORIGINAL_CONDITION)
+        patched, _changed = patcher.patch_router_text(original)
+        second, changed = patcher.patch_router_text(patched)
+        self.assertFalse(changed)
+        self.assertEqual(second, patched)
 
     def test_missing_quota_failure_anchor_fails_closed(self):
         original = upstream_fixture(
