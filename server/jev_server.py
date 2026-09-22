@@ -58,7 +58,9 @@ Jev never substitutes a third-party model.
 import base64
 import codecs
 import contextlib
+import gzip
 import hashlib
+import shutil
 import http.client
 import json
 import os
@@ -97,6 +99,11 @@ DEBUG_PATH = os.path.join(STATE, "jev-router.debug")
 # removed from replayed history, including legacy trailing signatures.
 SIGNATURE_PATH = os.path.join(STATE, "jev-router.signature")
 LOG_PATH = os.path.join(STATE, "jev-router-live.jsonl")
+LOG_MAX_BYTES = 20 * 1024 * 1024
+LOG_ARCHIVE_DIR = os.path.join(STATE, "logs", "archive")
+LOG_ARCHIVE_RETAIN_DAYS = 30
+LOG_ARCHIVE_MAX_BYTES = 200 * 1024 * 1024
+LOG_ARCHIVE_KEEP_SEGMENTS = 30
 SHADOW_EVAL_PATH = os.path.join(STATE, "jev-shadow-eval.jsonl")
 SESSION_PATH = os.path.join(STATE, "jev-router-sessions.json")
 SESSION_STORE = SessionStore(SESSION_PATH)
@@ -1156,20 +1163,23 @@ def route_marker(model, effort):
     return f" · {glyph} {short}" + (f":{effort}" if effort else "") + " · "
 
 
-def answer_signature(shown):
+def answer_signature(shown, reason=None):
     """Leading model/thinking label for each assistant message, when enabled."""
     if not os.path.exists(SIGNATURE_PATH):
         return None
     short, glyph = route_label(shown.get("model"))
     effort = shown.get("effort") or "non spécifié"
-    return f"**{glyph} {short} · thinking: {effort}**\n\n"
+    head = f"**{glyph} {short} · thinking: {effort}"
+    if reason:
+        head += f" · {reason}"
+    return head + "**\n\n"
 
 
 # Only our exact presentation forms, at the boundaries of assistant text.
 # Retain the trailing form solely for old transcripts.
 HEADER_RX = re.compile(
     r"\A\*\*(?:⚡|🧠|🚀|🌍|🐳|✨) [A-Za-z0-9._/-]+ · thinking: "
-    r"(?:low|medium|high|xhigh|max|non spécifié)\*\*\r?\n\r?\n")
+    r"(?:low|medium|high|xhigh|max|non spécifié)(?: · [^*\r\n]+)?\*\*\r?\n\r?\n")
 SIGNATURE_RX = re.compile(
     r"\s*\n*—\s+(?:⚡|🧠|🚀|🌍|🐳|✨)\s+[A-Za-z0-9._/-]+"
     r"(?:\s+·\s+(?:low|medium|high|xhigh|max))?\s*$")
@@ -1535,9 +1545,55 @@ def assemble_sse(raw):
     return None
 
 
+def _archive_log_segment(path):
+    """Gzip the sealed live log into a timestamped, non-destructive segment."""
+    os.makedirs(LOG_ARCHIVE_DIR, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dest = os.path.join(LOG_ARCHIVE_DIR, f"jev-router-live-{stamp}.jsonl.gz")
+    n = 1
+    while os.path.exists(dest):
+        dest = os.path.join(LOG_ARCHIVE_DIR, f"jev-router-live-{stamp}-{n}.jsonl.gz")
+        n += 1
+    with open(path, "rb") as src, gzip.open(dest, "wb") as out:
+        shutil.copyfileobj(src, out)
+    return dest
+
+
+def _prune_log_archives():
+    """Retention: drop only the OLDEST segments beyond the age/size budget."""
+    try:
+        segs = [os.path.join(LOG_ARCHIVE_DIR, f) for f in os.listdir(LOG_ARCHIVE_DIR)
+                if f.endswith(".jsonl.gz")]
+        segs.sort(key=lambda item: os.path.getmtime(item))
+        now = time.time()
+        for item in list(segs):
+            if now - os.path.getmtime(item) > LOG_ARCHIVE_RETAIN_DAYS * 86400:
+                os.remove(item)
+                segs.remove(item)
+        def total():
+            return sum(os.path.getsize(item) for item in segs)
+        while segs and (len(segs) > LOG_ARCHIVE_KEEP_SEGMENTS
+                        or total() > LOG_ARCHIVE_MAX_BYTES):
+            os.remove(segs.pop(0))
+    except OSError:
+        pass
+
+
+def _rotate_log_if_needed(path):
+    """Seal the bounded live log into the distillation corpus, then reset it."""
+    try:
+        if os.path.exists(path) and os.path.getsize(path) >= LOG_MAX_BYTES:
+            _archive_log_segment(path)
+            os.remove(path)
+            _prune_log_archives()
+    except OSError:
+        pass
+
+
 def log_line(record):
     try:
         with _log_lock:
+            _rotate_log_if_needed(LOG_PATH)
             with open(LOG_PATH, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError:
@@ -1964,13 +2020,19 @@ class Handler(BaseHTTPRequestHandler):
                     }}).encode("utf-8")
                     break
 
+                if signature is None:
+                    attempt_signature = None
+                else:
+                    _rsn = "↑连续失败" if escalated else (("↑熔断" if breaker_rerouted else None))
+                    attempt_signature = answer_signature(
+                        {"model": attempt_model, "effort": attempt_effort}, reason=_rsn)
                 apply_route(payload, attempt_model, attempt_effort)
                 quota_hit = False
                 with concrete_native_forward():
                     try:
                         status, out_kind, ctype, quota_hit, _u, signed_now, error_bytes = self._forward(
                             payload, out_path, stream_requested, debug, marker,
-                            attempt_model, signature, deadline=escalation_deadline)
+                            attempt_model, attempt_signature, deadline=escalation_deadline)
                     except (BrokenPipeError, ConnectionResetError):
                         breaker_release(attempt_model)
                         raise
@@ -2027,11 +2089,14 @@ class Handler(BaseHTTPRequestHandler):
                 }}).encode("utf-8")
                 self._write_error_response(status, error_bytes)
             else:
+                _ns_signature = None if signature is None else answer_signature(
+                    {"model": model, "effort": effort},
+                    reason=("↑熔断" if breaker_rerouted else None))
                 apply_route(payload, model, effort)
                 with concrete_native_forward():
                     try:
                         status, out_kind, ctype, quota_hit, _u, signed_now, error_bytes = self._forward(
-                            payload, out_path, stream_requested, debug, marker, model, signature)
+                            payload, out_path, stream_requested, debug, marker, model, _ns_signature)
                     except (BrokenPipeError, ConnectionResetError):
                         breaker_release(model)
                         raise

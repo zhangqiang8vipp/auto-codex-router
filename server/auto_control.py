@@ -166,6 +166,7 @@ def _run_control(script: str, action: str, model: Optional[str] = None):
         timeout=CONTROL_TIMEOUT_S,
         check=False,
         shell=False,
+        creationflags=(0x08000000 if os.name == "nt" else 0),
     )
 
 

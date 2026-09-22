@@ -507,6 +507,42 @@ class PerTurnSignature(unittest.TestCase):
         self.assertTrue(item["content"][0]["text"].startswith(self.SIG))
         self.assertTrue(m.did_sign)
 
+    def test_reason_is_appended_to_header(self):
+        with mock.patch.object(jev.os.path, "exists", return_value=True):
+            out = jev.answer_signature(
+                {"model": "gpt-5.6-sol", "effort": "high"}, reason="↑连续失败")
+        self.assertIn("· ↑连续失败**", out)
+
+    def test_header_rx_strips_a_reason_header(self):
+        with mock.patch.object(jev.os.path, "exists", return_value=True):
+            hdr = jev.answer_signature(
+                {"model": "gpt-5.6-sol", "effort": "high"}, reason="↑熔断")
+        self.assertEqual(jev.HEADER_RX.sub("", hdr), "")
+
+class LogRotation(unittest.TestCase):
+    def test_seals_compressed_archive_segment_and_resets_live(self):
+        import gzip
+        with tempfile.TemporaryDirectory() as d:
+            live = os.path.join(d, "live.jsonl")
+            arch = os.path.join(d, "archive")
+            with mock.patch.object(jev, "LOG_PATH", live), mock.patch.object(jev, "LOG_MAX_BYTES", 120), mock.patch.object(jev, "LOG_ARCHIVE_DIR", arch):
+                for i in range(20):
+                    jev.log_line({"i": i, "pad": "x"*40})
+            segs = [f for f in os.listdir(arch) if f.endswith(".jsonl.gz")]
+            self.assertTrue(segs)
+            blob = b"".join(gzip.open(os.path.join(arch, f)).read() for f in segs).decode()
+            self.assertIn('"i": 0', blob)
+            self.assertNotIn('"i": 0', open(live, encoding="utf-8").read())
+
+    def test_no_rotation_under_cap(self):
+        with tempfile.TemporaryDirectory() as d:
+            live = os.path.join(d, "live.jsonl")
+            arch = os.path.join(d, "archive")
+            with mock.patch.object(jev, "LOG_PATH", live), mock.patch.object(jev, "LOG_MAX_BYTES", 10**9), mock.patch.object(jev, "LOG_ARCHIVE_DIR", arch):
+                jev.log_line({"a": 1})
+            self.assertFalse(os.path.exists(arch))
+
+
 class Policy(unittest.TestCase):
     def test_a_low_confidence_user_turn_keeps_the_jev_choice(self):
         model, effort, speed, gate = jev.route(jev.LUNA, "low", 0.1, {"step_type": "user_turn"})

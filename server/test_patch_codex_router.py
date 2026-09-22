@@ -107,6 +107,25 @@ class CodexRouterExactRoutePatch(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(second, patched)
 
+    def test_archive_router_log_renames_oversized_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d)
+            log = state / "router.log"
+            log.write_bytes(b"x" * 1000)
+            with mock.patch.object(patcher, "ROUTER_LOG_MAX_BYTES", 100):
+                patcher._archive_router_log(state)
+            self.assertFalse(log.exists())
+            self.assertTrue((state / "router.log.archive").exists())
+
+    def test_archive_router_log_keeps_small_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d)
+            log = state / "router.log"
+            log.write_bytes(b"x")
+            patcher._archive_router_log(state)
+            self.assertTrue(log.exists())
+            self.assertFalse((state / "router.log.archive").exists())
+
     def test_missing_quota_failure_anchor_fails_closed(self):
         original = upstream_fixture(
             patcher.ORIGINAL_CONDITION,
@@ -152,7 +171,7 @@ class CodexRouterExactRoutePatch(unittest.TestCase):
                 self.assertTrue(first["changed"])
                 self.assertTrue(first["restarted"])
                 self.assertTrue(first["armed"])
-                restart.assert_called_once_with(root)
+                restart.assert_called_once_with(root, state)
 
                 restart.reset_mock()
                 second = patcher.ensure_patch(root, state, restart=True)
@@ -179,7 +198,7 @@ class CodexRouterExactRoutePatch(unittest.TestCase):
             self.assertFalse(result["changed"])
             self.assertTrue(result["restarted"])
             self.assertTrue(result["armed"])
-            restart.assert_called_once_with(root)
+            restart.assert_called_once_with(root, state)
 
 
 class JevExactRouteCapability(unittest.TestCase):
