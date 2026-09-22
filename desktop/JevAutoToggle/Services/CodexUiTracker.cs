@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Automation;
@@ -37,6 +38,11 @@ internal sealed class CodexUiTracker
                     requireModelName: true);
                 if (model is not null)
                     return model;
+
+                // No GPT-labelled control was exposed (collapsed composer,
+                // signed-out picker, locale without a model-name label). Keep
+                // the badge available by anchoring to the composer region.
+                return BuildFallbackAnchor(foreground, window.Current.ProcessId, windowBounds);
             }
 
             return null;
@@ -120,12 +126,32 @@ internal sealed class CodexUiTracker
         return best;
     }
 
-    private static bool LooksLikeCodexWindow(AutomationElement window)
+    private static CodexAnchor BuildFallbackAnchor(IntPtr foreground, int processId, Rect windowBounds)
+    {
+        // The model selector lives in the lower-right corner of the Codex
+        // window. Values are physical pixels (same space as BoundingRectangle).
+        const double rightMargin = 16;
+        const double bottomMargin = 18;
+        const double selectorWidth = 150;
+        const double selectorHeight = 34;
+
+        var left = windowBounds.Right - rightMargin - selectorWidth;
+        var top = windowBounds.Bottom - bottomMargin - selectorHeight;
+        return new CodexAnchor(
+            foreground,
+            processId,
+            new Rect(left, top, selectorWidth, selectorHeight),
+            "composer-fallback");
+    }
+
+    private bool LooksLikeCodexWindow(AutomationElement window)
     {
         string title;
+        int processId;
         try
         {
             title = (window.Current.Name ?? string.Empty).Trim();
+            processId = window.Current.ProcessId;
         }
         catch
         {
@@ -133,6 +159,12 @@ internal sealed class CodexUiTracker
         }
 
         if (title.Contains("Codex", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // Reliable identity regardless of window title or locale: the window
+        // belongs to the Codex desktop process (Electron main/renderer are all
+        // named "codex", and the image ships under OpenAI\Codex).
+        if (IsCodexProcess(processId))
             return true;
 
         // Current Chinese builds expose distinctive composer labels even when
@@ -151,6 +183,26 @@ internal sealed class CodexUiTracker
             catch (COMException) { }
         }
 
+        return false;
+    }
+
+    private static bool IsCodexProcess(int processId)
+    {
+        try
+        {
+            var process = Process.GetProcessById(processId);
+            if (string.Equals(process.ProcessName, "codex", StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            var path = process.MainModule?.FileName;
+            if (!string.IsNullOrEmpty(path)
+                && path.Contains(@"\OpenAI\Codex\", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        catch
+        {
+            // Access denied / exited / no module — fall through to other checks.
+        }
         return false;
     }
 
