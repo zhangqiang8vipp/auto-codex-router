@@ -331,7 +331,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "dv.policy":"Policy: KEEP by default; REPLAN only on evidence.","dv.chain":"Decision chain",
     "dv.current":"current","dv.available":"available","dv.planned":"planned",
     "md.tiers":"Model tiers","md.efforts":"Reasoning levels","md.catalog":"Execution models",
-    "md.special":"special / other","md.default":"default","md.hidden":"hidden from picker",
+    "md.special":"special / other","md.specialnote":"not on the auto-decision menu","md.default":"default","md.hidden":"hidden from picker","md.routable":"decision can pick","md.notroutable":"not auto-picked",
     "ac.title":"Live activity","ac.time":"Time","ac.model":"Model","ac.source":"Source",
     "ac.status":"Status","ac.task":"Task","ac.none":"No activity yet.",
     "ks.title":"Keys","ks.key":"Key","ks.layer":"Layer","ks.state":"State","ks.decision":"decision",
@@ -350,7 +350,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "dv.policy":"策略：默认保持（KEEP），只有出现证据才重新规划（REPLAN）。","dv.chain":"决策链",
     "dv.current":"当前","dv.available":"可用","dv.planned":"计划中",
     "md.tiers":"模型挡位","md.efforts":"推理强度","md.catalog":"最终干活模型",
-    "md.special":"特殊 / 其他","md.default":"默认","md.hidden":"不在选择器显示",
+    "md.special":"特殊 / 其他","md.specialnote":"以下不参与自动抉择","md.default":"默认","md.hidden":"不在选择器显示","md.routable":"可抉择","md.notroutable":"不参与自动抉择",
     "ac.title":"实时活动","ac.time":"时间","ac.model":"模型","ac.source":"来源",
     "ac.status":"状态","ac.task":"任务","ac.none":"暂无活动。",
     "ks.title":"密钥","ks.key":"密钥","ks.layer":"层级","ks.state":"状态","ks.decision":"决策",
@@ -441,13 +441,15 @@ PANEL_HTML = r'''<!DOCTYPE html>
     var html="";
     c.execution.forEach(function(g){
       var title=g.tier==="special"?t("md.special"):esc(tierShort(g.tier));
-      html+='<div class="group"><h3><span class="ranktag">'+title+'</span></h3>';
+      var gnote=g.tier==="special"?'<span style="font-size:11px;font-weight:400;" class="muted">'+t("md.specialnote")+'</span>':"";
+      html+='<div class="group"><h3><span class="ranktag">'+title+'</span>'+gnote+'</h3>';
       html+='<div class="models">'+g.models.map(function(m){
         var chips=m.efforts.map(function(e){
           return '<span class="mchip'+(e.effort===m.default_effort?" def":"")+'">'+e.effort+
             (e.effort===m.default_effort?" · "+t("md.default"):"")+'</span>';}).join("");
+        var rb=m.routable?'<span class="pill ok">'+t("md.routable")+'</span>':'<span class="pill no">'+t("md.notroutable")+'</span>';
         var hidden=m.visibility==="hide"?'<span class="pill off">'+t("md.hidden")+'</span>':"";
-        return '<div class="mcard"><div class="mh"><b>'+esc(m.name)+'</b>'+hidden+'</div><p>'+
+        return '<div class="mcard"><div class="mh"><b>'+esc(m.name)+'</b>'+rb+hidden+'</div><p>'+
           esc(m.description)+'</p><div class="mchips">'+chips+'</div></div>';
       }).join("")+'</div></div>';
     });

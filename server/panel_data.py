@@ -49,6 +49,7 @@ def _model_entry(raw: dict):
         "efforts": efforts,
         "visibility": raw.get("visibility") or "list",
         "in_api": bool(raw.get("supported_in_api")),
+        "routable": raw.get("slug") in TIERS,
     }
 
 
