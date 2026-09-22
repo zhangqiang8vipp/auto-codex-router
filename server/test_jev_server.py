@@ -700,8 +700,26 @@ class RuntimeSafety(unittest.TestCase):
             path, held = jev._native_redirect_paths()
             with open(held, "w", encoding="utf-8") as fh:
                 json.dump({"version": 1, "model": "jev/auto"}, fh)
+            # Without an explicit ON choice a stale held file is discarded, not restored.
+            self.assertFalse(jev.recover_native_redirect())
+            self.assertFalse(os.path.exists(held))
+            self.assertFalse(os.path.exists(path))
+            # An explicit operator ON choice makes startup restore the held redirect.
+            with open(held, "w", encoding="utf-8") as fh:
+                json.dump({"version": 1, "model": "jev/auto"}, fh)
+            jev.write_auto_desired(True)
             self.assertTrue(jev.recover_native_redirect())
             self.assertTrue(os.path.exists(path))
+            self.assertFalse(os.path.exists(held))
+
+    def test_explicit_off_removes_stray_live_redirect_at_startup(self):
+        with tempfile.TemporaryDirectory() as state, mock.patch.object(jev, "STATE", state):
+            path, held = jev._native_redirect_paths()
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"version": 1, "model": "jev/auto"}, fh)
+            jev.write_auto_desired(False)
+            self.assertFalse(jev.recover_native_redirect())
+            self.assertFalse(os.path.exists(path))
             self.assertFalse(os.path.exists(held))
 
     def test_native_redirect_does_not_overwrite_a_newer_operator_choice(self):

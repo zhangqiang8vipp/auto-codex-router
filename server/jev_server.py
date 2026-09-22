@@ -74,6 +74,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import counters
 import logrotate
 import web_panel
+import panel_data
 from auto_control import set_enabled as set_auto_enabled
 from auto_control import status as auto_status
 from route_lease import (RouteLeaseLocks, apply_failure_escalation,
@@ -673,23 +674,53 @@ def held_redirect_model():
     return model.strip() if isinstance(model, str) and model.strip() else None
 
 
-def recover_native_redirect():
-    """Recover a redirect left aside by an interrupted previous process.
+AUTO_DESIRED_PATH = os.path.join(STATE, "auto-desired.json")
 
-    If both files exist, the live path is newer/operator-owned and wins.
+
+def write_auto_desired(enabled):
+    """Persist the operator's explicit Auto choice across crash/restart."""
+    tmp = AUTO_DESIRED_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"enabled": bool(enabled)}, fh)
+    os.replace(tmp, AUTO_DESIRED_PATH)
+    try:
+        os.chmod(AUTO_DESIRED_PATH, 0o600)
+    except OSError:
+        pass
+
+
+def read_auto_desired():
+    """Return the explicit desired bool, or None if never set/unreadable."""
+    try:
+        data = json.load(open(AUTO_DESIRED_PATH, encoding="utf-8"))
+        value = data.get("enabled")
+        return bool(value) if isinstance(value, bool) else None
+    except (OSError, ValueError):
+        return None
+
+
+def recover_native_redirect():
+    """Resolve redirect state at startup using the operator's explicit choice.
+
+    A stale ``.routing-held`` file (left by a process force-killed mid-
+    suppression) is restored only when the operator explicitly wanted Auto ON.
+    Otherwise it is discarded, so an explicit OFF / default-OFF is never
+    resurrected by a restart. If both live and held exist, the live path is
+    newer and wins.
     """
+    desired = read_auto_desired()
     path, held = _native_redirect_paths()
     with _NATIVE_REDIRECT_LOCK:
         if _NATIVE_REDIRECT_DEPTH != 0:
             return False
         try:
-            if os.path.exists(path):
-                if os.path.exists(held):
-                    os.remove(held)
-                return False
             if os.path.exists(held):
-                os.replace(held, path)
-                return True
+                if desired is True and not os.path.exists(path):
+                    os.replace(held, path)
+                    return True
+                os.remove(held)
+            if os.path.exists(path) and desired is False:
+                os.remove(path)
         except OSError:
             pass
     return False
@@ -799,6 +830,50 @@ def load_key():
         except OSError:
             continue
     return os.environ.get("TYPESAFE_API_KEY", "").strip()
+
+
+def set_env_var(path, name, value):
+    """Replace or append NAME=VALUE in a dotenv file; never log the value."""
+    target = name + "=" + value
+    lines, found = [], False
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for item in fh:
+                if item.strip().startswith(name + "="):
+                    lines.append(target + "\n"); found = True
+                else:
+                    lines.append(item)
+    except FileNotFoundError:
+        lines = []
+    if not found:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] = lines[-1] + "\n"
+        lines.append(target + "\n")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write("".join(lines))
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return True
+
+
+def apply_key(kind, value):
+    """Persist a panel-provided key to the central env file; (ok, error)."""
+    spec = next((s for s in panel_data.KEY_KINDS if s["kind"] == kind), None)
+    if spec is None:
+        return False, "unknown key kind"
+    value = (value or "").strip()
+    if not value or len(value) > 4096 or any(c in value for c in "\r\n"):
+        return False, "invalid key value"
+    try:
+        set_env_var(ENV_PATH, spec["env"], value)
+    except OSError as exc:
+        return False, type(exc).__name__
+    return True, None
 
 
 def caller_secret():
@@ -1652,6 +1727,7 @@ class Handler(BaseHTTPRequestHandler):
                 result = set_auto_enabled(STATE, CODEX_ROUTER_DIR, body["enabled"])
                 if not body["enabled"]:
                     _discard_stale_held_redirect_locked()
+                write_auto_desired(body["enabled"])
         if busy:
             payload = self._auto_status()
             payload["error"] = "routing request in flight; retry Auto toggle shortly"
@@ -1661,6 +1737,21 @@ class Handler(BaseHTTPRequestHandler):
         payload["policy_version"] = POLICY_VERSION
         code = 200 if result.available and result.error is None else 503
         return self._json(code, payload)
+
+    def _set_key(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > CONTROL_MAX_BYTES:
+            self.close_connection = True
+            return self._json(413, {"error": {"message": "body too large"}})
+        raw = self.rfile.read(length) if length else b""
+        try:
+            body = json.loads(raw.decode("utf-8-sig"))
+        except ValueError:
+            return self._json(400, {"error": {"message": "invalid json"}})
+        ok, error = apply_key(body.get("kind"), body.get("value"))
+        if not ok:
+            return self._json(400, {"error": {"message": error or "invalid key"}})
+        return self._json(200, {"ok": True, "configured": True})
 
     def _ask(self):
         """Typed pass-through to System One for local callers (:4319, loopback only).
@@ -1723,6 +1814,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, self._auto_status())
         elif path in web_panel.RECENT_PATHS:
             self._json(200, {"records": web_panel.recent_records(LOG_PATH)})
+        elif path in ("/control/catalog", "/v1/control/catalog"):
+            self._json(200, panel_data.build(STATE, bool(load_key())))
         elif path == "/health":
             self._json(200, {"ok": True, "service": "jev-router", "version": VERSION,
                              "policy_version": POLICY_VERSION,
@@ -1749,6 +1842,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._ask()
         if path.rstrip("/") in ("/control/auto", "/v1/control/auto"):
             return self._auto_control()
+        if path.rstrip("/") in ("/control/key", "/v1/control/key"):
+            return self._set_key()
         if "/responses" not in path:
             return self._json(404, {"error": {"message": f"unsupported path {path}"}})
 
