@@ -656,6 +656,29 @@ class RuntimeSafety(unittest.TestCase):
                 restored = json.load(fh)
             self.assertEqual(restored["model"], "native/operator-choice")
             self.assertFalse(os.path.exists(held))
+    def test_disable_discards_stale_held_redirect_so_restart_cannot_restore_auto(self):
+        with tempfile.TemporaryDirectory() as state, mock.patch.object(jev, "STATE", state):
+            path, held = jev._native_redirect_paths()
+            # A crashed earlier process left the redirect held; depth is back to 0.
+            with open(held, "w", encoding="utf-8") as fh:
+                json.dump({"version": 1, "model": "jev/auto"}, fh)
+            with jev._NATIVE_REDIRECT_LOCK:
+                self.assertEqual(jev._NATIVE_REDIRECT_DEPTH, 0)
+                self.assertTrue(jev._discard_stale_held_redirect_locked())
+            # A subsequent process start must have nothing held to recover.
+            self.assertFalse(jev.recover_native_redirect())
+            self.assertFalse(os.path.exists(path))
+            self.assertFalse(os.path.exists(held))
+
+    def test_discard_held_is_refused_while_suppression_active(self):
+        with tempfile.TemporaryDirectory() as state, mock.patch.object(jev, "STATE", state):
+            path, held = jev._native_redirect_paths()
+            with open(held, "w", encoding="utf-8") as fh:
+                json.dump({"version": 1, "model": "jev/auto"}, fh)
+            with jev.native_redirect_suppressed():
+                self.assertFalse(jev._discard_stale_held_redirect_locked())
+            # The live suppression still restores its held redirect on exit.
+            self.assertTrue(os.path.exists(path))
 
     def test_deadline_timeout_is_capped_by_remaining_budget(self):
         with mock.patch.object(jev.time, "monotonic", return_value=10.0):
