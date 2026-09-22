@@ -86,7 +86,7 @@ The script must complete all of these stages:
 2. Shared ChatGPT session authorization.
 3. `jev` generic provider on `http://127.0.0.1:4319/v1`, adapter
    `openai-responses`, private-loopback explicitly allowed.
-4. `Jev Codex Router` hidden Scheduled Task plus 15-minute heartbeat.
+4. `Jev Codex Router` hidden Scheduled Task plus 5-minute supervisor heartbeat; the server runs detached.
 5. `Jev Codex Router Shadow Eval` daily Scheduled Task.
 6. Generic provider live test and curation of `jev/auto` with
    `low,medium,high,xhigh,max`.

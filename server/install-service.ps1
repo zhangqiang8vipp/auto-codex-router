@@ -62,9 +62,6 @@ function Wait-JevPortRelease([int]$TimeoutSeconds = 12) {
 
 function Test-JevServiceSurface {
   try {
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
-    if ($task.State -ne "Running") { return $false }
-
     $health = Invoke-RestMethod -Uri "http://127.0.0.1:4319/health" -TimeoutSec 2
     if ($health.ok -ne $true -or $health.service -ne "jev-router") { return $false }
 
@@ -189,8 +186,8 @@ $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $logon = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
 $heartbeatParams = @{
   Once = $true
-  At = (Get-Date).AddMinutes(15)
-  RepetitionInterval = (New-TimeSpan -Minutes 15)
+  At = (Get-Date).AddMinutes(5)
+  RepetitionInterval = (New-TimeSpan -Minutes 5)
   RepetitionDuration = (New-TimeSpan -Days 3650)
 }
 $heartbeat = New-ScheduledTaskTrigger @heartbeatParams
@@ -279,3 +276,4 @@ Write-Host "  service task: $TaskName"
 Write-Host "  eval task:    $EvalTaskName (daily 03:15, rolling 7 days)"
 Write-Host "  state:        $StateDir"
 Write-Host "Uninstall: powershell -NoProfile -ExecutionPolicy Bypass -File server\uninstall-service.ps1"
+
