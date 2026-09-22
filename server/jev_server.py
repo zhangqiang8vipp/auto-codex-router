@@ -97,6 +97,7 @@ DEBUG_PATH = os.path.join(STATE, "jev-router.debug")
 # removed from replayed history, including legacy trailing signatures.
 SIGNATURE_PATH = os.path.join(STATE, "jev-router.signature")
 LOG_PATH = os.path.join(STATE, "jev-router-live.jsonl")
+LOG_MAX_BYTES = 20 * 1024 * 1024
 SHADOW_EVAL_PATH = os.path.join(STATE, "jev-shadow-eval.jsonl")
 SESSION_PATH = os.path.join(STATE, "jev-router-sessions.json")
 SESSION_STORE = SessionStore(SESSION_PATH)
@@ -1156,20 +1157,23 @@ def route_marker(model, effort):
     return f" · {glyph} {short}" + (f":{effort}" if effort else "") + " · "
 
 
-def answer_signature(shown):
+def answer_signature(shown, reason=None):
     """Leading model/thinking label for each assistant message, when enabled."""
     if not os.path.exists(SIGNATURE_PATH):
         return None
     short, glyph = route_label(shown.get("model"))
     effort = shown.get("effort") or "non spécifié"
-    return f"**{glyph} {short} · thinking: {effort}**\n\n"
+    head = f"**{glyph} {short} · thinking: {effort}"
+    if reason:
+        head += f" · {reason}"
+    return head + "**\n\n"
 
 
 # Only our exact presentation forms, at the boundaries of assistant text.
 # Retain the trailing form solely for old transcripts.
 HEADER_RX = re.compile(
     r"\A\*\*(?:⚡|🧠|🚀|🌍|🐳|✨) [A-Za-z0-9._/-]+ · thinking: "
-    r"(?:low|medium|high|xhigh|max|non spécifié)\*\*\r?\n\r?\n")
+    r"(?:low|medium|high|xhigh|max|non spécifié)(?: · [^*\r\n]+)?\*\*\r?\n\r?\n")
 SIGNATURE_RX = re.compile(
     r"\s*\n*—\s+(?:⚡|🧠|🚀|🌍|🐳|✨)\s+[A-Za-z0-9._/-]+"
     r"(?:\s+·\s+(?:low|medium|high|xhigh|max))?\s*$")
@@ -1535,9 +1539,22 @@ def assemble_sse(raw):
     return None
 
 
+def _rotate_log_if_needed(path):
+    """Size-bounded rotation: keep one .1 backup so logs cannot grow unbounded."""
+    try:
+        if os.path.exists(path) and os.path.getsize(path) >= LOG_MAX_BYTES:
+            backup = path + ".1"
+            if os.path.exists(backup):
+                os.remove(backup)
+            os.replace(path, backup)
+    except OSError:
+        pass
+
+
 def log_line(record):
     try:
         with _log_lock:
+            _rotate_log_if_needed(LOG_PATH)
             with open(LOG_PATH, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     except OSError:
@@ -1964,13 +1981,19 @@ class Handler(BaseHTTPRequestHandler):
                     }}).encode("utf-8")
                     break
 
+                if signature is None:
+                    attempt_signature = None
+                else:
+                    _rsn = "↑连续失败" if escalated else (("↑熔断" if breaker_rerouted else None))
+                    attempt_signature = answer_signature(
+                        {"model": attempt_model, "effort": attempt_effort}, reason=_rsn)
                 apply_route(payload, attempt_model, attempt_effort)
                 quota_hit = False
                 with concrete_native_forward():
                     try:
                         status, out_kind, ctype, quota_hit, _u, signed_now, error_bytes = self._forward(
                             payload, out_path, stream_requested, debug, marker,
-                            attempt_model, signature, deadline=escalation_deadline)
+                            attempt_model, attempt_signature, deadline=escalation_deadline)
                     except (BrokenPipeError, ConnectionResetError):
                         breaker_release(attempt_model)
                         raise
@@ -2027,11 +2050,14 @@ class Handler(BaseHTTPRequestHandler):
                 }}).encode("utf-8")
                 self._write_error_response(status, error_bytes)
             else:
+                _ns_signature = None if signature is None else answer_signature(
+                    {"model": model, "effort": effort},
+                    reason=("↑熔断" if breaker_rerouted else None))
                 apply_route(payload, model, effort)
                 with concrete_native_forward():
                     try:
                         status, out_kind, ctype, quota_hit, _u, signed_now, error_bytes = self._forward(
-                            payload, out_path, stream_requested, debug, marker, model, signature)
+                            payload, out_path, stream_requested, debug, marker, model, _ns_signature)
                     except (BrokenPipeError, ConnectionResetError):
                         breaker_release(model)
                         raise

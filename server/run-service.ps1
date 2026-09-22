@@ -89,6 +89,17 @@ if (-not (Test-Path -LiteralPath $server -PathType Leaf)) {
 $outLog = Join-Path $StateDir "jev-router.out.log"
 $errLog = Join-Path $StateDir "jev-router.err.log"
 
+# Archive an oversized Node router.log before the patcher restarts Node, so the
+# router recreates a fresh file. Without this, router.log grows unbounded.
+$routerLog = Join-Path $StateDir "router.log"
+if (Test-Path -LiteralPath $routerLog) {
+  try {
+    if ((Get-Item -LiteralPath $routerLog).Length -gt 50MB) {
+      Move-Item -LiteralPath $routerLog -Destination (Join-Path $StateDir "router.log.archive") -Force
+    }
+  } catch {}
+}
+
 # Prefer Codex Router's authenticated exact-route probe over temporarily moving
 # native-redirect.json. The managed patch also restores native Codex hard-quota
 # 429 semantics after the local Jev provider hop. Both hooks are guarded and the
