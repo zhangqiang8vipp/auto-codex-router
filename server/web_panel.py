@@ -232,10 +232,10 @@ PANEL_HTML = r'''<!DOCTYPE html>
           </div>
           <div class="bar" id="mixBar"></div>
           <div class="legend">
-            <span><i class="dot" style="background:var(--blue)"></span><span data-i18n="lg.jev">Decision</span></span>
-            <span><i class="dot" style="background:var(--teal)"></span><span data-i18n="lg.keep">Lease keep</span></span>
-            <span><i class="dot" style="background:var(--amber)"></span><span data-i18n="lg.esc">Escalation</span></span>
-            <span><i class="dot" style="background:#6b7a8d"></span><span data-i18n="lg.other">Other</span></span>
+            <span><i class="dot" style="background:var(--blue)"></i><span data-i18n="lg.jev">Decision</span></span>
+            <span><i class="dot" style="background:var(--teal)"></i><span data-i18n="lg.keep">Lease keep</span></span>
+            <span><i class="dot" style="background:var(--amber)"></i><span data-i18n="lg.esc">Escalation</span></span>
+            <span><i class="dot" style="background:#6b7a8d"></i><span data-i18n="lg.other">Other</span></span>
           </div>
         </div>
       </div>
