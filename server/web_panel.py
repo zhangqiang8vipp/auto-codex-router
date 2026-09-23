@@ -104,6 +104,13 @@ PANEL_HTML = r'''<!DOCTYPE html>
   .pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:600;}
   .pill.on{background:rgba(52,199,89,.15);color:#248a3d;} .pill.off{background:#e9e9eb;color:var(--muted);}
   .pill.ok{background:rgba(52,199,89,.14);color:#248a3d;} .pill.no{background:#e9e9eb;color:var(--muted);}
+  .pill.deny{background:rgba(255,59,48,.14);color:#d70015;}
+  .rosterctl{display:flex;gap:6px;margin-top:12px;}
+  .rc{flex:1;padding:7px 10px;border-radius:9px;border:1px solid var(--line);background:var(--panel);
+    font-size:12px;font-weight:600;color:var(--text);cursor:pointer;transition:background .15s,color .15s;}
+  .rc.allow.active{background:var(--green);border-color:var(--green);color:#fff;}
+  .rc.deny.active{background:#ff3b30;border-color:#ff3b30;color:#fff;}
+  .rc:disabled{opacity:.5;cursor:default;}
   .kv{display:grid;grid-template-columns:auto 1fr;gap:8px 14px;margin:0;}
   .kv dt{color:var(--muted);} .kv dd{margin:0;font-weight:600;}
   .mono{font-family:ui-monospace,Consolas,monospace;}
@@ -278,6 +285,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
       </div>
       <div class="card full">
         <h2 data-i18n="md.catalog">Execution models</h2>
+        <p class="muted" style="font-size:12px;margin:-2px 0 12px;" data-i18n="roster.hint"></p>
         <div id="catalogGroups"></div>
       </div>
     </section>
@@ -321,7 +329,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
 (function(){
   var STR={
   en:{"brand":"Auto Codex Router","brandSub":"session-aware runtime","nav.overview":"Overview",
-    "nav.decision":"Decision","nav.models":"Work Models","nav.activity":"Live Activity","nav.keys":"Keys",
+    "nav.decision":"Decision","nav.models":"Model Roster","nav.activity":"Live Activity","nav.keys":"Keys",
     "healthy":"service healthy","ov.auto":"Auto routing","ov.current":"Current route","ov.model":"Model",
     "ov.effort":"Effort","ov.source":"Source","ov.why":"Why","ov.time":"Time","ov.today":"Today",
     "ov.stTotal":"Total","ov.stJev":"Decisions","ov.stKeep":"Lease keep","ov.stEsc":"Escalations",
@@ -332,6 +340,8 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "dv.current":"current","dv.available":"available","dv.planned":"planned",
     "md.tiers":"Model tiers","md.efforts":"Reasoning levels","md.catalog":"Execution models",
     "md.special":"special / other","md.specialnote":"not on the auto-decision menu","md.default":"default","md.hidden":"hidden from picker","md.routable":"decision can pick","md.notroutable":"not auto-picked",
+    "md.disabled":"disabled","roster.allow":"Whitelist","roster.deny":"Blacklist",
+    "roster.hint":"Whitelist = available for work, blacklist = disabled from selection. Takes effect immediately.",
     "ac.title":"Live activity","ac.time":"Time","ac.model":"Model","ac.source":"Source",
     "ac.status":"Status","ac.task":"Task","ac.none":"No activity yet.",
     "ks.title":"Keys","ks.key":"Key","ks.layer":"Layer","ks.state":"State","ks.decision":"decision",
@@ -340,7 +350,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "busy":"Working…","page.overview":"Overview","page.decision":"Decision","page.models":"Work Models",
     "page.activity":"Live Activity","page.keys":"Keys"},
   zh:{"brand":"自动 Codex 路由","brandSub":"会话感知运行时","nav.overview":"总览",
-    "nav.decision":"决策层","nav.models":"干活模型","nav.activity":"实时活动","nav.keys":"密钥",
+    "nav.decision":"决策层","nav.models":"模型名单","nav.activity":"实时活动","nav.keys":"密钥",
     "healthy":"服务正常","ov.auto":"自动路由","ov.current":"当前路由","ov.model":"模型",
     "ov.effort":"推理强度","ov.source":"来源","ov.why":"原因","ov.time":"时间","ov.today":"今日统计",
     "ov.stTotal":"总请求","ov.stJev":"决策","ov.stKeep":"租约复用","ov.stEsc":"升级",
@@ -351,6 +361,8 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "dv.current":"当前","dv.available":"可用","dv.planned":"计划中",
     "md.tiers":"模型挡位","md.efforts":"推理强度","md.catalog":"最终干活模型",
     "md.special":"特殊 / 其他","md.specialnote":"以下不参与自动抉择","md.default":"默认","md.hidden":"不在选择器显示","md.routable":"可抉择","md.notroutable":"不参与自动抉择",
+    "md.disabled":"已禁用","roster.allow":"白名单","roster.deny":"黑名单",
+    "roster.hint":"白名单＝可干活，黑名单＝禁用选择；实时生效。",
     "ac.title":"实时活动","ac.time":"时间","ac.model":"模型","ac.source":"来源",
     "ac.status":"状态","ac.task":"任务","ac.none":"暂无活动。",
     "ks.title":"密钥","ks.key":"密钥","ks.layer":"层级","ks.state":"状态","ks.decision":"决策",
@@ -381,15 +393,17 @@ PANEL_HTML = r'''<!DOCTYPE html>
   var EFFORT_PROFILE_ZH={low:"较小的推理预算。",medium:"适中的推理预算。",
     high:"充足的推理预算。",xhigh:"更大的推理预算。",max:"支持的最大推理预算。"};
   var MODEL_DESC_ZH={
-    "gpt-5.6-sol":"日常任务可靠的智能体主力模型。",
+    "gpt-6-luna":"面向较简单任务、快速且经济的模型。",
+    "gpt-6-sol":"用于编码和日常工作的主力模型。",
+    "gpt-6-astra":"面向最高难度工作的前沿智能模型。",
+    "gpt-5.6-luna":"旧版快速高效模型。",
+    "gpt-5.6-terra":"旧版均衡模型，用于直接明了的工作。",
+    "gpt-5.6-sol":"旧版编码模型，用于复杂工作。",
     "gpt-5.6-sol-1m":"最新前沿智能编码模型，运行在其文档所述的 100 万 token 上下文窗口；输入超过 27.2 万 token 的轮次按更高费率计费。",
-    "gpt-5.6-terra":"均衡的智能编码模型，适合日常工作。",
-    "gpt-5.6-luna":"快速、经济的智能编码模型。",
-    "gpt-6-astra":"我们最强的模型，用于复杂、高要求的工作。",
     "gpt-reserve":"快速、经济的智能编码模型。",
     "gpt-daybreak-blue-latest":"最新前沿智能编码模型，用于广泛的防御性网络安全工作。",
     "gpt-daybreak-red-latest":"最新前沿智能编码模型的网络进攻变体，用于高级、经授权的网络安全研究。",
-    "gpt-5.5":"经过验证的上一代模型，用于编码与通用工作。",
+    "gpt-5.5":"上一代遗留编码模型。",
     "gpt-5.4":"适合日常编码的强力模型。",
     "codex-auto-review":"Codex 的自动审批审查模型。",
     "jev/auto":"用户策展的 jev 模型；上下文窗口与输入模态以策展时供应商目录所标注的为准。"};
@@ -461,6 +475,12 @@ PANEL_HTML = r'''<!DOCTYPE html>
   }
 
   function tierShort(id){var p=String(id).split("-");return p[p.length-1];}
+  function rosterControl(m){
+    return '<div class="rosterctl" data-slug="'+esc(m.slug)+'">'+
+      '<button type="button" class="rc allow'+(m.roster==="allow"?" active":"")+'" data-state="allow">'+t("roster.allow")+'</button>'+
+      '<button type="button" class="rc deny'+(m.roster==="deny"?" active":"")+'" data-state="deny">'+t("roster.deny")+'</button></div>';
+  }
+
   function renderCatalog(c){
     catalog=c;
     // tiers
@@ -480,10 +500,14 @@ PANEL_HTML = r'''<!DOCTYPE html>
         var chips=m.efforts.map(function(e){
           return '<span class="mchip'+(e.effort===m.default_effort?" def":"")+'">'+e.effort+
             (e.effort===m.default_effort?" · "+t("md.default"):"")+'</span>';}).join("");
-        var rb=m.routable?'<span class="pill ok">'+t("md.routable")+'</span>':'<span class="pill no">'+t("md.notroutable")+'</span>';
-        var hidden=m.visibility==="hide"?'<span class="pill off">'+t("md.hidden")+'</span>':"";
+        var rb;
+        if(m.selectable){rb='<span class="pill ok">'+t("md.routable")+'</span>';}
+        else if(m.routable){rb='<span class="pill deny">'+t("md.disabled")+'</span>';}
+        else{rb='<span class="pill no">'+t("md.notroutable")+'</span>';}
+        var hidden=m.visibility=="hide"?'<span class="pill off">'+t("md.hidden")+'</span>':"";
         return '<div class="mcard"><div class="mh"><b>'+esc(m.name)+'</b>'+rb+hidden+'</div><p>'+
-          esc(modelDesc(m.slug,m.description))+'</p><div class="mchips">'+chips+'</div></div>';
+          esc(modelDesc(m.slug,m.description))+'</p><div class="mchips">'+chips+'</div>'+
+          rosterControl(m)+'</div>';
       }).join("")+'</div></div>';
     });
     $("catalogGroups").innerHTML=html;
@@ -555,6 +579,22 @@ PANEL_HTML = r'''<!DOCTYPE html>
         fetch("/control/catalog").then(function(r){return r.json();}).then(renderCatalog);})
       .catch(function(){$("keySave").disabled=false;$("keyNote").className="note bad";
         $("keyNote").textContent=t("flight");});
+  });
+
+  $("catalogGroups").addEventListener("click",function(ev){
+    var btn=ev.target.closest?ev.target.closest(".rc"):null; if(!btn)return;
+    var ctl=btn.parentNode, slug=ctl.getAttribute("data-slug"), state=btn.getAttribute("data-state");
+    if(btn.classList.contains("active"))return;
+    ctl.querySelectorAll(".rc").forEach(function(b){b.disabled=true;});
+    fetch("/control/roster",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({slug:slug,state:state})})
+      .then(function(r){return r.json().then(function(j){return{ok:r.ok,j:j};});})
+      .then(function(res){
+        if(res.ok){return fetch("/control/catalog").then(function(r){return r.json();}).then(renderCatalog);}
+        ctl.querySelectorAll(".rc").forEach(function(b){b.disabled=false;});
+        window.alert((res.j.error&&res.j.error.message)||t("flight"));
+      })
+      .catch(function(){ctl.querySelectorAll(".rc").forEach(function(b){b.disabled=false;});});
   });
 
   localize();refresh();

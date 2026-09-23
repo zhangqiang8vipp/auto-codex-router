@@ -75,6 +75,7 @@ import counters
 import logrotate
 import web_panel
 import panel_data
+import model_roster
 from auto_control import set_enabled as set_auto_enabled
 from auto_control import status as auto_status
 from route_lease import (RouteLeaseLocks, apply_failure_escalation,
@@ -1749,6 +1750,30 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             return self._json(400, {"error": {"message": "invalid json"}})
         ok, error = apply_key(body.get("kind"), body.get("value"))
+
+    def _set_roster(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > CONTROL_MAX_BYTES:
+            self.close_connection = True
+            return self._json(413, {"error": {"message": "body too large"}})
+        raw = self.rfile.read(length) if length else b""
+        try:
+            body = json.loads(raw.decode("utf-8-sig"))
+        except ValueError:
+            return self._json(400, {"error": {"message": "invalid json"}})
+        slug, state = body.get("slug"), body.get("state")
+        if not isinstance(slug, str) or state not in ("allow", "deny"):
+            return self._json(400, {"error": {"message": "slug and state(allow|deny) required"}})
+        roster = model_roster.load(STATE)
+        if state == "deny" and model_roster.state_for(slug, roster=roster) == "allow":
+            remaining = [t for t in model_roster.allowed_tiers(roster=roster) if t != slug]
+            if not remaining:
+                return self._json(409, {"error": {"message": "at least one model must stay enabled"}})
+        try:
+            model_roster.set_state(STATE, slug, state)
+        except (ValueError, OSError) as exc:
+            return self._json(400, {"error": {"message": str(exc)}})
+        return self._json(200, {"ok": True, "roster": model_roster.load(STATE)})
         if not ok:
             return self._json(400, {"error": {"message": error or "invalid key"}})
         return self._json(200, {"ok": True, "configured": True})
@@ -1844,6 +1869,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._auto_control()
         if path.rstrip("/") in ("/control/key", "/v1/control/key"):
             return self._set_key()
+        if path.rstrip("/") in ("/control/roster", "/v1/control/roster"):
+            return self._set_roster()
         if "/responses" not in path:
             return self._json(404, {"error": {"message": f"unsupported path {path}"}})
 
@@ -1913,6 +1940,9 @@ class Handler(BaseHTTPRequestHandler):
                 tool_key=tool_key,
             )
             lease = read_lease(session, POLICY_VERSION)
+            roster = model_roster.load(STATE)
+            roster_allowed = model_roster.allowed_tiers(roster=roster)
+            roster_empty = not roster_allowed
 
             # Feedback and failure state are event-based, not transport-replay
             # based. An identical replay must not count the same failed tool
@@ -1940,17 +1970,24 @@ class Handler(BaseHTTPRequestHandler):
                 compacted=compacted,
             )
 
-            if os.path.exists(OFF_PATH):
-                model, effort, speed, gate = ASTRA, None, "default", "off"
+            if os.path.exists(OFF_PATH) or roster_empty:
+                model, effort, speed, gate = (
+                    ASTRA, None, "default",
+                    ("roster_empty" if roster_empty and not os.path.exists(OFF_PATH) else "off"))
                 route_source = "off"
                 if thread_key:
                     SESSION_STORE.put(thread_key, failure_streak=failure_streak)
-            elif lease_action == "KEEP" and lease is not None:
+            elif (lease_action == "KEEP" and lease is not None
+                  and model_roster.is_allowed(lease.model, roster=roster)):
                 active_turn_key = lease.turn_key or turn_key
                 model, effort, speed = lease.model, lease.effort, "default"
                 model, effort, local_escalation = apply_failure_escalation(
                     model, effort, failure_streak
                 )
+                _rc = model_roster.enforce(model, effort, roster=roster)
+                if _rc is not None and _rc != (model, effort):
+                    model, effort = _rc
+                    local_escalation = local_escalation or "roster_clamp"
                 route_source = "lease_escalation" if local_escalation else "lease"
                 smart_gate = local_escalation or "lease_keep"
                 gate = f"lease:{lease_reason}"
@@ -1994,18 +2031,25 @@ class Handler(BaseHTTPRequestHandler):
                         model, effort, speed, gate = route(tier, depth)
                         model, effort, smart_gate = apply_guardrails(
                             model, effort, task, step, session, failure_streak)
+                        _rc = model_roster.enforce(model, effort, roster=roster)
+                        if _rc is not None and _rc != (model, effort):
+                            model, effort = _rc
+                            smart_gate = (smart_gate + "+roster_clamp"
+                                          if smart_gate != "apply" else "roster_clamp")
                         if smart_gate != "apply":
                             gate = f"{gate}+{smart_gate}"
                         route_source = "jev"
                     except Exception as exc:
+                        _fb = roster_allowed[-1] if roster_allowed else ASTRA
                         model, effort, speed, gate = (
-                            ASTRA, "medium", "default",
+                            _fb, "medium", "default",
                             f"jev_error:{type(exc).__name__}"
                         )
                         route_source = "jev_error_fallback"
                     jev_ms = int((time.time() - jt0) * 1000)
                 else:
-                    model, effort, speed, gate = ASTRA, "medium", "default", "no_key_or_task"
+                    _fb = roster_allowed[-1] if roster_allowed else ASTRA
+                    model, effort, speed, gate = _fb, "medium", "default", "no_key_or_task"
                     route_source = "fallback"
 
                 # Even a technical fallback becomes the continuity route for
@@ -2156,15 +2200,21 @@ class Handler(BaseHTTPRequestHandler):
                     break
 
                 idx = TIERS.index(attempt_model) if attempt_model in TIERS else -1
-                if (status in RETRYABLE_UPSTREAM and idx + 1 < len(TIERS)
-                        and time.monotonic() < escalation_deadline):
-                    next_model, skipped_open = breaker_pick(TIERS[idx + 1])
+                _cands = [t for t in TIERS[idx + 1:]
+                          if model_roster.is_allowed(t, roster=roster)]
+                next_model = None
+                skipped_open = False
+                for _cand in _cands:
+                    next_model, skipped_open = breaker_pick(_cand)
                     if next_model is not None:
-                        attempt_model = next_model
-                        escalated = True
-                        if skipped_open and "+breaker" not in gate:
-                            gate = f"{gate}+breaker"
-                        continue
+                        break
+                if (status in RETRYABLE_UPSTREAM and next_model is not None
+                        and time.monotonic() < escalation_deadline):
+                    attempt_model = next_model
+                    escalated = True
+                    if skipped_open and "+breaker" not in gate:
+                        gate = f"{gate}+breaker"
+                    continue
                 break
 
             model = attempt_model

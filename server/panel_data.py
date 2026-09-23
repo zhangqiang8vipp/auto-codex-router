@@ -12,6 +12,8 @@ import os
 from routing_policy import (ASTRA, DEPTH_PROFILES, EFFORTS, LUNA, MODEL_PROFILES,
                            SOL, TIERS, TERRA)
 
+import model_roster
+
 TIER_ORDER = [(LUNA, "luna"), (TERRA, "terra"), (SOL, "sol"), (ASTRA, "astra")]
 
 KEY_KINDS = [
@@ -92,6 +94,17 @@ def _key_status(decision_key: bool):
     return out
 
 
+def _annotated_groups(state_dir: str, merged_path: str):
+    """Execution groups with each model's roster state and effective selectability."""
+    roster = model_roster.load(state_dir)
+    groups = _execution_groups(merged_path)
+    for group in groups:
+        for entry in group["models"]:
+            entry["roster"] = model_roster.state_for(entry["slug"], roster=roster)
+            entry["selectable"] = bool(entry["routable"]) and entry["roster"] == "allow"
+    return groups
+
+
 def build(state_dir: str, decision_key: bool):
     merged_path = os.path.join(state_dir, "merged-models.json")
     return {
@@ -119,6 +132,6 @@ def build(state_dir: str, decision_key: bool):
             for idx, (model, key) in enumerate(TIER_ORDER)
         ],
         "efforts": [{"id": e, "profile": DEPTH_PROFILES[e]} for e in EFFORTS],
-        "execution": _execution_groups(merged_path),
+        "execution": _annotated_groups(state_dir, merged_path),
         "keys": _key_status(decision_key),
     }
