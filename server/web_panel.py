@@ -46,6 +46,7 @@ def recent_records(log_path: str, limit: int = RECENT_LIMIT):
             "step": rec.get("step"),
             "tool": rec.get("tool"),
             "compacted": bool(rec.get("compacted")),
+            "subagent": rec.get("subagent"),
             "task": (str(rec.get("task") or "")[:80]),
         })
     return records[-limit:]
@@ -371,9 +372,9 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "roster.hint":"Whitelist = available for work, blacklist = disabled from selection. Takes effect immediately.",
     "ac.title":"Live activity","ac.time":"Time","ac.model":"Model","ac.source":"Source",
     "ac.status":"Status","ac.task":"Task","ac.none":"No activity yet.",
-    "ac.k.user":"User","ac.k.tool":"Tool","ac.k.compaction":"Compact","ac.k.subresume":"Subtask",
+    "ac.k.user":"User","ac.k.tool":"Tool","ac.k.compaction":"Compact","ac.k.subagent":"Subtask","ac.k.subresume":"Subtask",
     "ac.k.context":"Context","ac.k.other":"Other","ac.toolstep":"tool step","ac.compaction":"Context compaction",
-    "ac.subresume":"Subtask continuation","ac.context":"Rules / context injection",
+    "ac.subagent":"Subagent delegation","ac.subresume":"Subtask continuation","ac.context":"Rules / context injection",
     "ks.title":"Keys","ks.key":"Key","ks.layer":"Layer","ks.state":"State","ks.decision":"decision",
     "ks.provider":"provider","ks.value":"Paste key","ks.save":"Save","ks.note":"Keys are stored locally and never logged.",
     "ks.configured":"configured","ks.missing":"missing","ks.saved":"Saved.","flight":"Routing in flight; retry shortly.",
@@ -396,9 +397,9 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "roster.hint":"白名单＝可干活，黑名单＝禁用选择；实时生效。",
     "ac.title":"实时活动","ac.time":"时间","ac.model":"模型","ac.source":"来源",
     "ac.status":"状态","ac.task":"任务","ac.none":"暂无活动。",
-    "ac.k.user":"用户","ac.k.tool":"工具","ac.k.compaction":"压缩","ac.k.subresume":"子任务",
+    "ac.k.user":"用户","ac.k.tool":"工具","ac.k.compaction":"压缩","ac.k.subagent":"子任务","ac.k.subresume":"子任务",
     "ac.k.context":"上下文","ac.k.other":"其他","ac.toolstep":"工具步骤","ac.compaction":"上下文压缩",
-    "ac.subresume":"子任务续跑","ac.context":"规则 / 上下文注入",
+    "ac.subagent":"子任务委派","ac.subresume":"子任务续跑","ac.context":"规则 / 上下文注入",
     "ks.title":"密钥","ks.key":"密钥","ks.layer":"层级","ks.state":"状态","ks.decision":"决策",
     "ks.provider":"供应商","ks.value":"粘贴密钥","ks.save":"保存","ks.note":"密钥仅保存在本地，不会被记录。",
     "ks.configured":"已配置","ks.missing":"未配置","ks.saved":"已保存。","flight":"有路由请求进行中，请稍后再试。",
@@ -592,6 +593,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
   function activityKind(r){
     var t0=r.task||"";
     if(r.compacted||/CONTEXT CHECKPOINT COMPACTION|handoff summary for another/i.test(t0))return "compaction";
+    if(r.subagent)return "subagent";
     if(/Another language model started|summary of its thinking|Continue from where it left off/i.test(t0))return "subresume";
     if(/^#\s*(AGENTS\.md|Overview)|<INSTRUCTIONS>/.test(t0))return "context";
     if(r.step==="tool_step")return "tool";
@@ -601,6 +603,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
   function activityLabel(r,k){
     if(k==="tool")return (r.tool||t("ac.toolstep"));
     if(k==="compaction")return t("ac.compaction");
+    if(k==="subagent"){var sa=r.subagent;return(sa&&sa!=="1"&&String(sa).toLowerCase()!=="true")?sa:t("ac.subagent");}
     if(k==="subresume")return t("ac.subresume");
     if(k==="context")return t("ac.context");
     if(k==="user")return (r.task||"");

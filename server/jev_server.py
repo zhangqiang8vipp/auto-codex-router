@@ -1930,6 +1930,12 @@ class Handler(BaseHTTPRequestHandler):
         active_turn_key = turn_key
         tool_key = tool_step_key(payload, digest=step.get("digest") or "", session_key=thread_key)
         compacted = contains_compaction(payload)
+        _raw_subagent = self.headers.get("x-openai-subagent")
+        subagent = _raw_subagent.strip() if isinstance(_raw_subagent, str) else None
+        if subagent is not None and (
+            not subagent or len(subagent) > 256 or "\r" in subagent or "\n" in subagent
+        ):
+            subagent = None
         meaningful_user_turn = (
             step.get("step_type") == "user_turn"
             and (bool(task) or bool(signals.get("has_image")))
@@ -2201,7 +2207,8 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         status, out_kind, ctype, quota_hit, _u, signed_now, error_bytes = self._forward(
                             payload, out_path, stream_requested, debug, marker,
-                            attempt_model, attempt_signature, deadline=escalation_deadline)
+                            attempt_model, attempt_signature, deadline=escalation_deadline,
+                            subagent=subagent)
                     except (BrokenPipeError, ConnectionResetError):
                         breaker_release(attempt_model)
                         raise
@@ -2270,7 +2277,8 @@ class Handler(BaseHTTPRequestHandler):
                 with concrete_native_forward():
                     try:
                         status, out_kind, ctype, quota_hit, _u, signed_now, error_bytes = self._forward(
-                            payload, out_path, stream_requested, debug, marker, model, _ns_signature)
+                            payload, out_path, stream_requested, debug, marker, model, _ns_signature,
+                            subagent=subagent)
                     except (BrokenPipeError, ConnectionResetError):
                         breaker_release(model)
                         raise
@@ -2364,6 +2372,7 @@ class Handler(BaseHTTPRequestHandler):
             "errored": step["errored"],
             "tool": ((step.get("tool_call") or {}).get("name") or None),
             "compacted": bool(compacted),
+            "subagent": subagent,
             "digest_len": len(step["digest"]),
             "smart_gate": smart_gate,
             "failure_streak": failure_streak,
@@ -2419,7 +2428,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(error_bytes)
 
     def _forward(self, payload, out_path, stream_requested, debug, marker, model,
-                 signature=None, deadline=None):
+                 signature=None, deadline=None, subagent=None):
         """One relay attempt to the local caller edge, streamed straight back.
 
         Once downstream headers have been committed, failures are terminal for
@@ -2456,6 +2465,7 @@ class Handler(BaseHTTPRequestHandler):
                     # source hook extends that same meaning to native redirect,
                     # so a Jev-selected native tier cannot recurse to jev/auto.
                     "x-codex-router-exact-route": "1",
+                    **({"x-openai-subagent": subagent} if subagent else {}),
                 },
             )
             resp = conn.getresponse()

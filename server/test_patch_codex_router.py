@@ -9,6 +9,44 @@ import patch_codex_router as patcher
 import jev_server as jev
 
 
+# Synthetic router.mjs tail that also provides the original routedHeaders
+# function and the buildRoutedRequest call site the subagent hooks target.
+ROUTER_HEADERS_FIXTURE = (
+    patcher.ROUTER_ROUTED_HEADERS_ORIGINAL
+    + "function buildRoutedRequest() {\n"
+    "  return {\n"
+    "    body: 1,\n"
+    "    target: routedResponsesTarget(route),\n"
+    "    headers: routedHeaders(),\n"
+    "  };\n"
+    "}\n"
+)
+
+
+def write_additional_source_files(root):
+    """Create api-forwarder.mjs and litellm-config.mjs with original anchors."""
+    src = root / "src"
+    (src / "api-forwarder.mjs").write_text(
+        "function forwarder() {}\n" + patcher.FORWARDER_ORIGINAL,
+        encoding="utf-8",
+    )
+    (src / "litellm-config.mjs").write_text(
+        "function renderer() {}\n" + patcher.LITELLM_CFG_ORIGINAL,
+        encoding="utf-8",
+    )
+
+
+def write_patched_additional_source_files(root):
+    """Same as above but with the subagent hooks already applied."""
+    write_additional_source_files(root)
+    patcher.patch_additional_router_file(
+        root, patcher.FORWARDER_REL,
+        patcher.FORWARDER_ORIGINAL, patcher.FORWARDER_PATCHED, patcher.SUBAGENT_TAG)
+    patcher.patch_additional_router_file(
+        root, patcher.LITELLM_CFG_REL,
+        patcher.LITELLM_CFG_ORIGINAL, patcher.LITELLM_CFG_PATCHED, patcher.SUBAGENT_TAG)
+
+
 def upstream_fixture(condition, include_quota_anchor=True):
     failure = (
         "      failedBodyText = await boundedResponseText(\n"
@@ -54,6 +92,7 @@ def upstream_fixture(condition, include_quota_anchor=True):
         "  }\n"
         "}\n"
         + normalize_fn
+        + ROUTER_HEADERS_FIXTURE
     )
 
 
@@ -165,6 +204,7 @@ class CodexRouterExactRoutePatch(unittest.TestCase):
                 upstream_fixture(patcher.ORIGINAL_CONDITION),
                 encoding="utf-8",
             )
+            write_additional_source_files(root)
             state = root / "state"
             with mock.patch.object(patcher, "restart_router") as restart:
                 first = patcher.ensure_patch(root, state, restart=True)
@@ -192,6 +232,7 @@ class CodexRouterExactRoutePatch(unittest.TestCase):
                 )[0],
                 encoding="utf-8",
             )
+            write_patched_additional_source_files(root)
             state = root / "state"
             with mock.patch.object(patcher, "restart_router") as restart:
                 result = patcher.ensure_patch(root, state, restart=True)
@@ -199,6 +240,58 @@ class CodexRouterExactRoutePatch(unittest.TestCase):
             self.assertTrue(result["restarted"])
             self.assertTrue(result["armed"])
             restart.assert_called_once_with(root, state)
+
+    def test_patch_adds_subagent_passthrough_hooks(self):
+        original = upstream_fixture(patcher.ORIGINAL_CONDITION)
+        patched, changed = patcher.patch_router_text(original)
+        self.assertTrue(changed)
+        self.assertIn(patcher.SUBAGENT_TAG, patched)
+        self.assertIn("routedHeaders(request.headers)", patched)
+        self.assertIn("incomingHeaders", patched)
+
+    def test_subagent_passthrough_hooks_are_idempotent(self):
+        original = upstream_fixture(patcher.ORIGINAL_CONDITION)
+        patched, _changed = patcher.patch_router_text(original)
+        second, changed = patcher.patch_router_text(patched)
+        self.assertFalse(changed)
+        self.assertEqual(second, patched)
+
+    def test_ensure_patch_reports_subagent_passthrough(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_dir = root / "src"
+            source_dir.mkdir()
+            (source_dir / "router.mjs").write_text(
+                upstream_fixture(patcher.ORIGINAL_CONDITION), encoding="utf-8")
+            write_additional_source_files(root)
+            state = root / "state"
+            with mock.patch.object(patcher, "restart_router"):
+                result = patcher.ensure_patch(root, state, restart=True)
+            self.assertTrue(result["subagent_passthrough"])
+
+    def test_missing_additional_file_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_dir = root / "src"
+            source_dir.mkdir()
+            (source_dir / "router.mjs").write_text(
+                upstream_fixture(patcher.ORIGINAL_CONDITION), encoding="utf-8")
+            # api-forwarder present, litellm-config missing -> fail-closed.
+            (source_dir / "api-forwarder.mjs").write_text(
+                patcher.FORWARDER_ORIGINAL, encoding="utf-8")
+            state = root / "state"
+            with self.assertRaises(patcher.PatchError):
+                patcher.ensure_patch(root, state, restart=False)
+
+    def test_support_false_when_tags_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_dir = root / "src"
+            source_dir.mkdir()
+            (source_dir / "router.mjs").write_text(
+                upstream_fixture(patcher.ORIGINAL_CONDITION), encoding="utf-8")
+            write_additional_source_files(root)
+            self.assertFalse(patcher.source_supports_subagent_passthrough(root))
 
 
 class JevExactRouteCapability(unittest.TestCase):

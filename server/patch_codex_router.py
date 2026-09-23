@@ -196,6 +196,143 @@ async function jevNormalizeAgentItem(request, item, payload, signal) {
 '''
 
 
+# --- Subagent marker passthrough ---------------------------------------------
+# Codex marks a delegated subagent turn with `x-openai-subagent`. The default
+# routed/generic boundaries strip that header, so the final native request
+# would differ from what Codex sends itself. These narrow, idempotent hooks
+# carry the one header across our own loopback hops and restore it on the
+# exact-route callback. Every anchor is fail-closed and newline-preserving.
+SUBAGENT_TAG = "jev-pass-through-subagent"
+
+# router.mjs: routedHeaders() accepts the incoming headers and preserves the
+# subagent marker; buildRoutedRequest then passes request.headers in.
+ROUTER_ROUTED_HEADERS_ORIGINAL = r'''function routedHeaders() {
+  return {
+    Authorization: `Bearer ${INTERNAL_KEY}`,
+    "Content-Type": "application/json",
+    "Accept-Encoding": "identity",
+    "User-Agent": `codex-router/${VERSION}`,
+  };
+}
+'''
+ROUTER_ROUTED_HEADERS_PATCHED = r'''function routedHeaders(incomingHeaders) {
+  const headers = {
+    Authorization: `Bearer ${INTERNAL_KEY}`,
+    "Content-Type": "application/json",
+    "Accept-Encoding": "identity",
+    "User-Agent": `codex-router/${VERSION}`,
+  };
+  // jev-pass-through-subagent: the Jev decision loop is our own loopback hop.
+  // Preserve the subagent marker so the selected tier's final native request
+  // carries the identical header Codex would send itself. LiteLLM forwards it
+  // only because the jev-auto model group is allowlisted; the API forwarder
+  // relays it to Jev, which re-attaches it on the exact route callback.
+  let subagent = incomingHeaders?.["x-openai-subagent"];
+  if (Array.isArray(subagent)) subagent = subagent.join(", ");
+  if (
+    typeof subagent === 'string' &&
+    subagent.length >= 1 &&
+    subagent.length <= 256 &&
+    !/[\r\n]/.test(subagent)
+  ) {
+    headers["x-openai-subagent"] = subagent;
+  }
+  return headers;
+}
+'''
+ROUTER_CALLSITE_ORIGINAL = r'''    target: routedResponsesTarget(route),
+    headers: routedHeaders(),
+'''
+ROUTER_CALLSITE_PATCHED = r'''    target: routedResponsesTarget(route),
+    headers: routedHeaders(request.headers),
+'''
+
+# api-forwarder.mjs: let the subagent marker reach the jev loopback provider.
+FORWARDER_REL = ("src", "api-forwarder.mjs")
+FORWARDER_ORIGINAL = r'''    if (lower.startsWith("x-openai-") || lower === "chatgpt-account-id") continue;
+'''
+FORWARDER_PATCHED = r'''    if (lower.startsWith("x-openai-") || lower === "chatgpt-account-id") {
+      // jev-pass-through-subagent: the jev generic provider is our own loopback
+      // decision service. Keep the subagent marker for it; strip every other
+      // x-openai-* header exactly as before.
+      const jevSubagentRelay = provider?.generic === true &&
+        provider.id === "jev" && lower === "x-openai-subagent";
+      if (!jevSubagentRelay) continue;
+    }
+'''
+
+# litellm-config.mjs: allowlist x- header forwarding for the jev-auto group.
+LITELLM_CFG_REL = ("src", "litellm-config.mjs")
+LITELLM_CFG_ORIGINAL = r'''    "litellm_settings:",
+    "  callbacks: [grok_service_tier_callback.grok_service_tier_callback]",
+    "  drop_params": true,
+    "  request_timeout": 600",
+    "",
+'''
+LITELLM_CFG_PATCHED = r'''    "litellm_settings:",
+    "  callbacks: [grok_service_tier_callback.grok_service_tier_callback]",
+    "  drop_params: true",
+    "  request_timeout: 600",
+    // jev-pass-through-subagent: forward the x-openai-subagent marker (and only
+    // x- headers on LiteLLM's allowlist) through the jev-auto decision group.
+    // Scoped to this one loopback group -- never globally -- so every other
+    // deployment keeps the default header-stripping behavior.
+    "  model_group_settings:",
+    "    forward_client_headers_to_llm_api:",
+    "    - jev-auto",
+    "",
+'''
+
+
+def _detect_newline(text: str) -> str:
+    return "\r\n" if "\r\n" in text else "\n"
+
+
+def _to_newline(block: str, newline: str) -> str:
+    return block.replace("\n", newline) if newline == "\r\n" else block
+
+
+def _apply_tagged_hook(text: str, original: str, patched: str, tag: str):
+    """Idempotent, fail-closed textual hook identified by a comment tag."""
+    newline = _detect_newline(text)
+    if tag in text:
+        return text, False
+    original_nl = _to_newline(original, newline)
+    if text.count(original_nl) != 1:
+        raise PatchError("Jev subagent hook anchor missing or ambiguous.")
+    patched_nl = _to_newline(patched, newline)
+    return text.replace(original_nl, patched_nl, 1), True
+
+
+def _apply_plain_hook(text: str, original: str, patched: str):
+    """Idempotent, fail-closed textual hook identified by its patched form."""
+    newline = _detect_newline(text)
+    original_nl = _to_newline(original, newline)
+    patched_nl = _to_newline(patched, newline)
+    if patched_nl in text:
+        return text, False
+    if text.count(original_nl) != 1:
+        raise PatchError("Jev subagent call-site anchor missing or ambiguous.")
+    return text.replace(original_nl, patched_nl, 1), True
+
+
+def source_supports_subagent_passthrough(router_dir: Path) -> bool:
+    """Whether the subagent marker is carried across all three managed files."""
+    checks = (
+        (("src", "router.mjs"), SUBAGENT_TAG),
+        (FORWARDER_REL, SUBAGENT_TAG),
+        (LITELLM_CFG_REL, SUBAGENT_TAG),
+    )
+    for rel, tag in checks:
+        path = router_dir.joinpath(*rel)
+        try:
+            if tag not in path.read_text(encoding="utf-8"):
+                return False
+        except OSError:
+            return False
+    return True
+
+
 def source_supports_exact_native_route(text: str) -> bool:
     """Whether both managed caller-edge hooks are present."""
     if PATCHED_CONDITION not in text:
@@ -284,6 +421,15 @@ def patch_router_text(text: str) -> tuple[str, bool]:
         text = text.replace(loop_anchor, AGENT_RELAY_LOOP_REPLACEMENT, 1)
         changed = True
 
+    # Subagent marker passthrough (router.mjs): the routedHeaders function and
+    # the buildRoutedRequest call site.
+    text, sub_changed = _apply_tagged_hook(
+        text, ROUTER_ROUTED_HEADERS_ORIGINAL, ROUTER_ROUTED_HEADERS_PATCHED, SUBAGENT_TAG)
+    changed = changed or sub_changed
+    text, sub_changed = _apply_plain_hook(
+        text, ROUTER_CALLSITE_ORIGINAL, ROUTER_CALLSITE_PATCHED)
+    changed = changed or sub_changed
+
     if not source_supports_exact_native_route(text):
         raise PatchError("Patched Codex Router source did not pass verification.")
     return text, changed
@@ -323,6 +469,39 @@ def patch_router_file(router_dir: Path) -> tuple[Path, bool]:
         except FileNotFoundError:
             pass
     return router_path, True
+
+
+def patch_additional_router_file(router_dir: Path, rel, original, patched, tag):
+    """Apply one idempotent subagent hook to a non-router.mjs source file."""
+    path = router_dir.joinpath(*rel)
+    if not path.is_file():
+        raise PatchError(f"Codex Router source not found: {path}")
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PatchError(f"Codex Router source is not UTF-8: {path}") from exc
+
+    text, changed = _apply_tagged_hook(text, original, patched, tag)
+    if not changed:
+        return path, False
+
+    encoded = text.encode("utf-8")
+    mode = stat.S_IMODE(path.stat().st_mode)
+    fd, tmp_name = tempfile.mkstemp(prefix=".jev-router-patch-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(encoded)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp_name, mode)
+        os.replace(tmp_name, path)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+    return path, True
 
 
 def source_sha256(path: Path) -> str:
@@ -419,6 +598,11 @@ def restart_router(router_dir: Path, state_dir: Path) -> None:
 
 def ensure_patch(router_dir: Path, state_dir: Path, restart: bool) -> dict:
     router_path, changed = patch_router_file(router_dir)
+    _, fwd_changed = patch_additional_router_file(
+        router_dir, FORWARDER_REL, FORWARDER_ORIGINAL, FORWARDER_PATCHED, SUBAGENT_TAG)
+    _, cfg_changed = patch_additional_router_file(
+        router_dir, LITELLM_CFG_REL, LITELLM_CFG_ORIGINAL, LITELLM_CFG_PATCHED, SUBAGENT_TAG)
+    changed = changed or fwd_changed or cfg_changed
     sha256 = source_sha256(router_path)
     armed = marker_matches(state_dir, router_path, sha256)
     restarted = False
@@ -439,6 +623,7 @@ def ensure_patch(router_dir: Path, state_dir: Path, restart: bool) -> dict:
         "router": str(router_path),
         "router_sha256": sha256,
         "exact_native_route": armed,
+        "subagent_passthrough": source_supports_subagent_passthrough(router_dir),
     }
 
 
@@ -462,6 +647,7 @@ def check_patch(router_dir: Path, state_dir: Path) -> dict:
         "router": str(router_path),
         "router_sha256": sha256,
         "exact_native_route": armed,
+        "subagent_passthrough": source_supports_subagent_passthrough(router_dir),
     }
 
 
