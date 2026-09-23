@@ -22,10 +22,11 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from routing_policy import ASTRA, EFFORTS, SOL, TIERS
+from routing_policy import ASTRA, EFFORTS, MASTER_RANK, SOL
 
 LEASE_VERSION = 1
-TIER_RANK = {name: index for index, name in enumerate(TIERS)}
+# Any known model (general or specialized) may legally hold a lease.
+TIER_RANK = dict(MASTER_RANK)
 EFFORT_RANK = {name: index for index, name in enumerate(EFFORTS)}
 
 

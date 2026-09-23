@@ -26,23 +26,28 @@ class PanelDataTests(unittest.TestCase):
             _model("gpt-5.6-luna"),
             _model("gpt-5.6-terra"),
             _model("gpt-5.5", default="xhigh", visibility="hide"),
+            _model("x-custom-thing"),
         ]}
         with open(os.path.join(state, "merged-models.json"), "w",
                   encoding="utf-8") as fh:
             json.dump(catalog, fh)
 
-    def test_build_groups_models_by_tier(self):
+    def test_build_groups_models_by_order(self):
         with tempfile.TemporaryDirectory() as state:
             self._write(state)
             data = panel_data.build(state, True)
             groups = {g["tier"]: g for g in data["execution"]}
-            self.assertEqual(groups["gpt-5.6-luna"]["models"][0]["slug"],
-                             "gpt-5.6-luna")
-            self.assertEqual(groups["gpt-5.6-terra"]["models"][0]["slug"],
-                             "gpt-5.6-terra")
-            self.assertEqual(groups["special"]["models"][0]["slug"], "gpt-5.5")
-            # effort chips carry descriptions and the default is flagged later in UI.
-            luna = groups["gpt-5.6-luna"]["models"][0]
+            # Known general models are ordered by the master general order.
+            general_slugs = [m["slug"] for m in groups["general"]["models"]]
+            self.assertEqual(
+                general_slugs,
+                ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.5"])
+            # Unknown models join the special bucket.
+            self.assertEqual(groups["special"]["models"][0]["slug"],
+                             "x-custom-thing")
+            # These older models default to the blacklist -> not selectable.
+            luna = groups["general"]["models"][0]
+            self.assertFalse(luna["selectable"])
             self.assertEqual(luna["default_effort"], "medium")
             self.assertEqual(luna["efforts"][0]["effort"], "low")
 
@@ -65,7 +70,8 @@ class PanelDataTests(unittest.TestCase):
             data = panel_data.build(state, False)
             self.assertEqual(
                 sum(len(g["models"]) for g in data["execution"]), 0)
-            self.assertEqual(len(data["tiers"]), 4)
+            # No catalog means no active ladder and no tier cards.
+            self.assertEqual(len(data["tiers"]), 0)
             self.assertEqual(len(data["efforts"]), 5)
 
 

@@ -1,20 +1,20 @@
 """Build the rich catalog payload for the built-in control panel.
 
-Pure read-only aggregation: execution models (grouped by tier), the decision
-layer (judge + decision chain), tier/effort reference and key status. Nothing
-here reads or returns secret values - only configured/missing booleans.
+Read-only aggregation: the live execution models (general coding family plus
+specialized models), the decision layer (judge + decision chain), tier/effort
+reference and key status. The roster whitelist determines which models
+participate in decisions; the candidate set is the whitelist intersected with
+the live Codex catalog. Nothing here reads or returns secret values.
 """
 from __future__ import annotations
 
 import json
 import os
 
-from routing_policy import (ASTRA, DEPTH_PROFILES, EFFORTS, LUNA, MODEL_PROFILES,
-                           SOL, TIERS, TERRA)
+from routing_policy import (DEPTH_PROFILES, EFFORTS, GENERAL_ORDER, MASTER_ORDER,
+                           MODEL_PROFILES, SPECIAL_ORDER)
 
 import model_roster
-
-TIER_ORDER = [(LUNA, "luna"), (TERRA, "terra"), (SOL, "sol"), (ASTRA, "astra")]
 
 KEY_KINDS = [
     {"kind": "typesafe", "env": "TYPESAFE_API_KEY", "layer": "decision"},
@@ -22,14 +22,6 @@ KEY_KINDS = [
     {"kind": "opencode_go", "env": "OPENCODE_GO_API_KEY", "layer": "provider"},
     {"kind": "openrouter", "env": "OPENROUTER_API_KEY", "layer": "provider"},
 ]
-
-
-def _tier_of(slug: str):
-    s = (slug or "").lower()
-    for model, key in TIER_ORDER:
-        if key in s:
-            return model
-    return None
 
 
 def _model_entry(raw: dict):
@@ -43,43 +35,72 @@ def _model_entry(raw: dict):
                         DEPTH_PROFILES.get(effort, "")})
     if not efforts:
         efforts = [{"effort": e, "description": DEPTH_PROFILES[e]} for e in EFFORTS]
+    slug = raw.get("slug")
     return {
-        "slug": raw.get("slug"),
-        "name": raw.get("display_name") or raw.get("slug"),
+        "slug": slug,
+        "name": raw.get("display_name") or slug,
         "description": raw.get("description") or "",
         "default_effort": raw.get("default_reasoning_level"),
         "efforts": efforts,
         "visibility": raw.get("visibility") or "list",
         "in_api": bool(raw.get("supported_in_api")),
-        "routable": raw.get("slug") in TIERS,
+        # A known, API-capable model can participate once whitelisted.
+        "routable": bool(raw.get("supported_in_api")) and slug in MASTER_ORDER,
     }
 
 
-def _execution_groups(merged_path: str):
+def _read_entries(merged_path: str):
     try:
         data = json.load(open(merged_path, encoding="utf-8"))
         raws = data.get("models") or []
     except (OSError, ValueError):
         raws = []
-    buckets = {model: [] for model, _ in TIER_ORDER}
-    other = []
+    entries = {}
     for raw in raws:
+        if not isinstance(raw, dict):
+            continue
         entry = _model_entry(raw)
-        tier = _tier_of(entry["slug"])
-        if tier:
-            buckets[tier].append(entry)
-        else:
-            other.append(entry)
+        if entry["slug"]:
+            entries[entry["slug"]] = entry
+    return entries
+
+
+def _execution_groups(state_dir: str, merged_path: str):
+    """All catalog models, ordered and annotated with live roster state."""
+    roster = model_roster.load(state_dir)
+    entries = _read_entries(merged_path)
+    present = list(entries)
+
+    general_present = [s for s in GENERAL_ORDER if s in entries]
+    special_present = [s for s in SPECIAL_ORDER if s in entries]
+    # Unknown models (not in the master registry) join the special bucket.
+    known = set(MASTER_ORDER)
+    unknown_present = [s for s in present if s not in known]
+
+    gen_candidates, sp_candidates = model_roster.candidate_sets(
+        present, roster=roster)
+    selectable = set(gen_candidates + sp_candidates)
+
+    def annotate(slug: str):
+        entry = entries[slug]
+        entry["roster"] = model_roster.state_for(slug, roster=roster)
+        entry["selectable"] = slug in selectable
+        return entry
+
     groups = []
-    for model, key in TIER_ORDER:
+    if general_present:
         groups.append({
-            "tier": model, "key": key,
-            "profile": MODEL_PROFILES[model],
-            "models": buckets[model],
+            "tier": "general", "key": "general", "profile": "",
+            "models": [annotate(s) for s in general_present],
         })
-    if other:
-        groups.append({"tier": "special", "key": "special", "profile": "", "models": other})
-    return groups
+    special_all = special_present + unknown_present
+    if special_all:
+        groups.append({
+            "tier": "special", "key": "special", "profile": "",
+            "models": [annotate(s) for s in special_all],
+        })
+    # The active general ladder (whitelist ∩ catalog), for the tier cards.
+    return groups, gen_candidates
 
 
 def _key_status(decision_key: bool):
@@ -94,19 +115,9 @@ def _key_status(decision_key: bool):
     return out
 
 
-def _annotated_groups(state_dir: str, merged_path: str):
-    """Execution groups with each model's roster state and effective selectability."""
-    roster = model_roster.load(state_dir)
-    groups = _execution_groups(merged_path)
-    for group in groups:
-        for entry in group["models"]:
-            entry["roster"] = model_roster.state_for(entry["slug"], roster=roster)
-            entry["selectable"] = bool(entry["routable"]) and entry["roster"] == "allow"
-    return groups
-
-
 def build(state_dir: str, decision_key: bool):
     merged_path = os.path.join(state_dir, "merged-models.json")
+    groups, active_ladder = _execution_groups(state_dir, merged_path)
     return {
         "decision": {
             "judge": {
@@ -127,11 +138,11 @@ def build(state_dir: str, decision_key: bool):
             "decides": ["model_tier", "reasoning_effort", "lease"],
         },
         "tiers": [
-            {"id": model, "key": key, "rank": idx + 1,
-             "profile": MODEL_PROFILES[model]}
-            for idx, (model, key) in enumerate(TIER_ORDER)
+            {"id": model, "key": model, "rank": idx + 1,
+             "profile": MODEL_PROFILES.get(model, "")}
+            for idx, model in enumerate(active_ladder)
         ],
         "efforts": [{"id": e, "profile": DEPTH_PROFILES[e]} for e in EFFORTS],
-        "execution": _annotated_groups(state_dir, merged_path),
+        "execution": groups,
         "keys": _key_status(decision_key),
     }

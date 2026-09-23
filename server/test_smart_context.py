@@ -6,6 +6,9 @@ from unittest import mock
 
 import smart_context as smart
 
+# The active general ladder for the default GPT-6 whitelist.
+LADDER = [smart.LUNA, smart.SOL, smart.ASTRA]
+
 
 class SessionIdentity(unittest.TestCase):
     def user(self, text, item_id=None):
@@ -76,11 +79,11 @@ class Guardrails(unittest.TestCase):
     def step(self, kind="user_turn", errored=False):
         return {"step_type": kind, "errored": errored}
 
-    def test_tier_order_includes_terra(self):
-        self.assertEqual(smart.TIERS, (smart.LUNA, smart.TERRA, smart.SOL, smart.ASTRA))
+    def test_default_ladder_is_gpt6(self):
+        self.assertEqual(smart.TIERS, (smart.LUNA, smart.SOL, smart.ASTRA))
 
     def test_effort_order_matches_codex_five_rungs(self):
-        self.assertEqual(smart.EFFORTS, ("low", "medium", "high", "xhigh", "max"))
+        self.assertEqual(tuple(smart.EFFORTS), ("low", "medium", "high", "xhigh", "max"))
 
     def test_successful_tool_step_can_still_drop_to_luna_low(self):
         model, effort, gate = smart.apply_guardrails(
@@ -115,7 +118,7 @@ class Guardrails(unittest.TestCase):
     def test_short_continuation_can_only_drop_one_model_and_effort_rung(self):
         model, effort, gate = smart.apply_guardrails(
             smart.LUNA, "low", "继续", self.step("user_turn"),
-            {"last_model": smart.ASTRA, "last_effort": "max"}, 0,
+            {"last_model": smart.ASTRA, "last_effort": "max"}, 0, LADDER,
         )
         self.assertEqual((model, effort), (smart.SOL, "xhigh"))
         self.assertIn("continuation_model_hysteresis", gate)
@@ -124,7 +127,7 @@ class Guardrails(unittest.TestCase):
     def test_one_rung_drop_is_allowed(self):
         model, effort, gate = smart.apply_guardrails(
             smart.TERRA, "high", "继续", self.step("user_turn"),
-            {"last_model": smart.SOL, "last_effort": "xhigh"}, 0,
+            {"last_model": smart.SOL, "last_effort": "xhigh"}, 0, LADDER,
         )
         self.assertEqual((model, effort, gate), (smart.TERRA, "high", "apply"))
 

@@ -83,7 +83,8 @@ from route_lease import (RouteLeaseLocks, apply_failure_escalation,
                          lease_fields, read_lease, route_action,
                          served_continuity_fields, tool_step_key)
 from routing_policy import (ASTRA, EFFORTS, LUNA, POLICY_VERSION, QUESTIONS, SOL,
-                            TERRA, TIERS, decision_from_answers, route)
+                            TERRA, TIERS, build_route_question, decision_from_answers,
+                            route, route_pairs_for)
 from smart_context import (RepoProfiler, SessionStore, apply_guardrails,
                            enrich_jev_state, extract_cwd, session_key)
 from shadow_eval import (append_event as append_shadow_event,
@@ -105,6 +106,18 @@ DEBUG_PATH = os.path.join(STATE, "jev-router.debug")
 # removed from replayed history, including legacy trailing signatures.
 SIGNATURE_PATH = os.path.join(STATE, "jev-router.signature")
 LOG_PATH = os.path.join(STATE, "jev-router-live.jsonl")
+MERGED_CATALOG_PATH = os.path.join(STATE, "merged-models.json")
+
+
+def catalog_slugs():
+    """Slugs present in the live merged Codex catalog (best-effort)."""
+    try:
+        with open(MERGED_CATALOG_PATH, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return []
+    return [m.get("slug") for m in (data.get("models") or [])
+            if isinstance(m, dict) and m.get("slug")]
 LOG_MAX_BYTES = 20 * 1024 * 1024
 LOG_ARCHIVE_DIR = os.path.join(STATE, "logs", "archive")
 LOG_ARCHIVE_RETAIN_DAYS = 30
@@ -316,7 +329,7 @@ def _purge_route_cache(now):
         _route_cache.pop(next(iter(_route_cache)))
 
 
-def call_jev_for_route(key, state, request_bytes, timeout=4.0):
+def call_jev_for_route(key, state, request_bytes, timeout=4.0, questions=None):
     """One paid Jev route judgement per identical request within the short TTL.
 
     Returns (result, reuse), where reuse is miss, hit or coalesced. Failures are
@@ -342,15 +355,15 @@ def call_jev_for_route(key, state, request_bytes, timeout=4.0):
         if not flight.event.wait(ROUTE_SINGLEFLIGHT_WAIT_S):
             # A wedged leader must not wedge the request forever. This bounded
             # escape is intentionally not cached; normal calls finish in <=4s.
-            return call_jev_routed(key, state, timeout=timeout), "miss"
+            return call_jev_routed(key, state, questions=questions, timeout=timeout), "miss"
         if flight.error is not None:
             raise flight.error
         if flight.result is not None:
             return flight.result, "coalesced"
-        return call_jev_routed(key, state, timeout=timeout), "miss"
+        return call_jev_routed(key, state, questions=questions, timeout=timeout), "miss"
 
     try:
-        result = call_jev_routed(key, state, timeout=timeout)
+        result = call_jev_routed(key, state, questions=questions, timeout=timeout)
         flight.result = result
         with _route_cache_lock:
             _route_cache[cache_key] = (time.monotonic() + ROUTE_CACHE_SAFETY_TTL_S, result)
@@ -974,12 +987,13 @@ def breaker_release(model):
             _BREAKER[model] = (count, first_ts, open_until, False)
 
 
-def breaker_pick(preferred_model):
+def breaker_pick(preferred_model, ladder=None):
     """Claim preferred or the next available *higher* tier; never wrap downward."""
-    if preferred_model not in TIERS:
+    ladder = tuple(ladder) if ladder else TIERS
+    if preferred_model not in ladder:
         return preferred_model, False
-    idx = TIERS.index(preferred_model)
-    for candidate in TIERS[idx:]:
+    idx = ladder.index(preferred_model)
+    for candidate in ladder[idx:]:
         if breaker_available(candidate):
             return candidate, candidate != preferred_model
     return None, True
@@ -1235,18 +1249,25 @@ def _debug_shape(payload):
 
 
 ROUTE_GLYPHS = {
-    "gpt-5.6-luna": ("luna", "⚡"),      # cheap tier, adaptive thinking
-    "gpt-5.6-sol": ("sol", "🧠"),        # reasoning workhorse
+    "gpt-6-luna": ("luna", "⚡"),        # cheap tier, adaptive thinking
+    "gpt-6-sol": ("sol", "🧠"),          # reasoning workhorse
     "gpt-6-astra": ("astra", "🚀"),      # frontier
     TERRA: ("terra", "🌍"),
+    # previous generation retained for mixed rosters
+    "gpt-5.6-luna": ("luna", "⚡"),
+    "gpt-5.6-sol": ("sol", "🧠"),
 }
 def route_label(model):
-    """(short name, glyph) of a routed call — the vocabulary of both tags."""
-    short, glyph = ROUTE_GLYPHS.get(model, (None, None))
-    if not short:
-        leaf = (model or "?").split("/")[-1]
-        short, glyph = leaf, "⚡"
-    return short, glyph
+    """(concrete model name, glyph) of a routed call — the vocabulary of both tags.
+
+    The full slug is used rather than just 'luna'/'sol' because more than one
+    generation shares each short name (e.g. gpt-5.6-luna vs gpt-6-luna).
+    """
+    name = (model or "?").split("/")[-1]
+    _, glyph = ROUTE_GLYPHS.get(model, (None, "⚡"))
+    if not glyph:
+        glyph = "⚡"
+    return name, glyph
 
 
 def route_marker(model, effort):
@@ -1941,7 +1962,11 @@ class Handler(BaseHTTPRequestHandler):
             )
             lease = read_lease(session, POLICY_VERSION)
             roster = model_roster.load(STATE)
-            roster_allowed = model_roster.allowed_tiers(roster=roster)
+            _gen_cands, _sp_cands = model_roster.candidate_sets(
+                catalog_slugs(), roster=roster)
+            general_cands = _gen_cands
+            roster_allowed = _gen_cands + _sp_cands
+            top_general = general_cands[-1] if general_cands else ASTRA
             roster_empty = not roster_allowed
 
             # Feedback and failure state are event-based, not transport-replay
@@ -1978,13 +2003,13 @@ class Handler(BaseHTTPRequestHandler):
                 if thread_key:
                     SESSION_STORE.put(thread_key, failure_streak=failure_streak)
             elif (lease_action == "KEEP" and lease is not None
-                  and model_roster.is_allowed(lease.model, roster=roster)):
+                  and lease.model in roster_allowed):
                 active_turn_key = lease.turn_key or turn_key
                 model, effort, speed = lease.model, lease.effort, "default"
                 model, effort, local_escalation = apply_failure_escalation(
                     model, effort, failure_streak
                 )
-                _rc = model_roster.enforce(model, effort, roster=roster)
+                _rc = model_roster.enforce(model, effort, roster_allowed)
                 if _rc is not None and _rc != (model, effort):
                     model, effort = _rc
                     local_escalation = local_escalation or "roster_clamp"
@@ -2015,8 +2040,12 @@ class Handler(BaseHTTPRequestHandler):
                     state = jev_state(task, prev_assistant, signals, step)
                     state = enrich_jev_state(state, task, session, repo, failure_streak)
                     try:
-                        result, jev_cache = call_jev_for_route(key, state, raw)
-                        decision = decision_from_answers(result.get("answers"))
+                        _questions = build_route_question(roster_allowed)
+                        result, jev_cache = call_jev_for_route(
+                            key, state, raw, questions=_questions)
+                        decision = decision_from_answers(
+                            result.get("answers"),
+                            pairs=route_pairs_for(roster_allowed))
                         raw_usage = result.get("usage") or {}
                         if not isinstance(raw_usage, dict):
                             raw_usage = {}
@@ -2030,8 +2059,9 @@ class Handler(BaseHTTPRequestHandler):
                                              decision["confidence"])
                         model, effort, speed, gate = route(tier, depth)
                         model, effort, smart_gate = apply_guardrails(
-                            model, effort, task, step, session, failure_streak)
-                        _rc = model_roster.enforce(model, effort, roster=roster)
+                            model, effort, task, step, session, failure_streak,
+                            general_cands)
+                        _rc = model_roster.enforce(model, effort, roster_allowed)
                         if _rc is not None and _rc != (model, effort):
                             model, effort = _rc
                             smart_gate = (smart_gate + "+roster_clamp"
@@ -2040,7 +2070,7 @@ class Handler(BaseHTTPRequestHandler):
                             gate = f"{gate}+{smart_gate}"
                         route_source = "jev"
                     except Exception as exc:
-                        _fb = roster_allowed[-1] if roster_allowed else ASTRA
+                        _fb = top_general
                         model, effort, speed, gate = (
                             _fb, "medium", "default",
                             f"jev_error:{type(exc).__name__}"
@@ -2048,7 +2078,7 @@ class Handler(BaseHTTPRequestHandler):
                         route_source = "jev_error_fallback"
                     jev_ms = int((time.time() - jt0) * 1000)
                 else:
-                    _fb = roster_allowed[-1] if roster_allowed else ASTRA
+                    _fb = top_general
                     model, effort, speed, gate = _fb, "medium", "default", "no_key_or_task"
                     route_source = "fallback"
 
@@ -2056,7 +2086,7 @@ class Handler(BaseHTTPRequestHandler):
                 # this user turn. Otherwise every tool result after one Jev
                 # outage would ask Jev again or accidentally resurrect the
                 # previous task's lease.
-                if thread_key and model in TIERS and effort in EFFORTS:
+                if thread_key and model in roster_allowed and effort in EFFORTS:
                     SESSION_STORE.put(
                         thread_key,
                         failure_streak=failure_streak,
@@ -2097,7 +2127,7 @@ class Handler(BaseHTTPRequestHandler):
         # and other operational overrides have chosen the model that will really
         # be served. This avoids reserving a half-open probe for a model that is
         # later replaced before any upstream attempt occurs.
-        alt_model, breaker_rerouted = breaker_pick(model)
+        alt_model, breaker_rerouted = breaker_pick(model, ladder=general_cands)
         if alt_model is None:
             breaker_blocked = True
             gate = f"{gate}+breaker_open"
@@ -2199,13 +2229,12 @@ class Handler(BaseHTTPRequestHandler):
                     # not one physical tier. Never escalate through every tier.
                     break
 
-                idx = TIERS.index(attempt_model) if attempt_model in TIERS else -1
-                _cands = [t for t in TIERS[idx + 1:]
-                          if model_roster.is_allowed(t, roster=roster)]
+                idx = general_cands.index(attempt_model) if attempt_model in general_cands else -1
+                _cands = list(general_cands[idx + 1:]) if idx >= 0 else []
                 next_model = None
                 skipped_open = False
                 for _cand in _cands:
-                    next_model, skipped_open = breaker_pick(_cand)
+                    next_model, skipped_open = breaker_pick(_cand, ladder=general_cands)
                     if next_model is not None:
                         break
                 if (status in RETRYABLE_UPSTREAM and next_model is not None
@@ -2275,7 +2304,7 @@ class Handler(BaseHTTPRequestHandler):
             # human turn without asking Jev again. Guard the write with the
             # semantic lock and turn key so a slow old turn cannot overwrite
             # a newer user's route lease.
-            if (thread_key and model in TIERS and effort in EFFORTS
+            if (thread_key and model in roster_allowed and effort in EFFORTS
                     and not os.path.exists(SHADOW_PATH)):
                 with ROUTE_LEASE_LOCKS.hold(thread_key):
                     latest_session = SESSION_STORE.get(thread_key)

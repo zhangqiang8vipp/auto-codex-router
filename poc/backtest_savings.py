@@ -26,8 +26,10 @@ RESULT_PATH = os.path.expanduser("~/.codex/codex-router/jev-backtest.json")
 # Prices per 1M tokens (short context, OpenAI API page, Sep 2026)
 PRICES = {
     "gpt-6-astra":   (10.00, 50.00, 1.00, 12.50),   # (input, output, cached_in, cache_write)
-    "gpt-5.6-sol":   (4.00, 20.00, 0.40, 5.00),
+    "gpt-6-sol":     (2.00, 10.00, 0.20, 2.50),
+    "gpt-6-luna":    (0.10, 0.50, 0.01, 0.125),
     "gpt-5.6-terra": (2.00, 12.00, 0.20, 2.50),
+    "gpt-5.6-sol":   (4.00, 20.00, 0.40, 5.00),
     "gpt-5.6-luna":  (0.20, 1.20, 0.02, 0.25),
     # off-peak, aligned with V4 Flash (cf. router docs)
     "deepseek/deepseek-v4.1-flash": (0.15, 0.60, 0.015, 0.15),

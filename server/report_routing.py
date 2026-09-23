@@ -63,15 +63,18 @@ import sys
 LIVE_LOG = os.path.expanduser("~/.codex/codex-router/jev-router-live.jsonl")
 BACKTEST_STATE = os.path.expanduser("~/.codex/codex-router/jev-backtest.json")
 
-LUNA, TERRA, SOL, ASTRA = "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-6-astra"
+LUNA, SOL, ASTRA = "gpt-6-luna", "gpt-6-sol", "gpt-6-astra"
+TERRA = "gpt-5.6-terra"
 
 # Prices per 1M tokens (input, output, cached input, cache write), short context,
 # Sep 2026 — kept identical to poc/backtest_savings.py so the two tools agree.
 PRICES = {
     ASTRA: (10.00, 50.00, 1.00, 12.50),
-    SOL: (4.00, 20.00, 0.40, 5.00),
-    "gpt-5.6-terra": (2.00, 12.00, 0.20, 2.50),
-    LUNA: (0.20, 1.20, 0.02, 0.25),
+    SOL: (2.00, 10.00, 0.20, 2.50),
+    TERRA: (2.00, 12.00, 0.20, 2.50),
+    LUNA: (0.10, 0.50, 0.01, 0.125),
+    "gpt-5.6-sol": (4.00, 20.00, 0.40, 5.00),
+    "gpt-5.6-luna": (0.20, 1.20, 0.02, 0.25),
     # Codex-dry tandem (Go allowance), off-peak.
     "deepseek/deepseek-v4.1-flash": (0.15, 0.60, 0.015, 0.15),
 }
@@ -101,10 +104,14 @@ CONF_GATE = 0.5  # historical diagnostics only; joint routing has no confidence 
 # https://learn.chatgpt.com/docs/pricing
 # (input, cached input, output) per million tokens. Reasoning is part of output.
 CREDIT_RATES = {
-    LUNA: (5.0, 0.5, 30.0),
-    TERRA: (50.0, 5.0, 300.0),
-    SOL: (100.0, 10.0, 500.0),
+    # current generation (GPT-6)
+    LUNA: (2.5, 0.25, 12.5),
+    SOL: (50.0, 5.0, 250.0),
     ASTRA: (250.0, 25.0, 1250.0),
+    TERRA: (50.0, 5.0, 300.0),
+    # previous generation (GPT-5.6), retained for observed/historical pairs
+    "gpt-5.6-luna": (5.0, 0.5, 30.0),
+    "gpt-5.6-sol": (100.0, 10.0, 500.0),
 }
 
 

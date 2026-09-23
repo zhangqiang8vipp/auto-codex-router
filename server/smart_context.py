@@ -20,13 +20,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-LUNA = "gpt-5.6-luna"
-TERRA = "gpt-5.6-terra"
-SOL = "gpt-5.6-sol"
-ASTRA = "gpt-6-astra"
-TIERS = (LUNA, TERRA, SOL, ASTRA)
-TIER_RANK = {name: index for index, name in enumerate(TIERS)}
-EFFORTS = ("low", "medium", "high", "xhigh", "max")
+from routing_policy import (ASTRA, EFFORTS, GENERAL_ORDER, GENERAL_RANK,
+                           LUNA, MASTER_RANK, SOL, TERRA, TIERS)
+# Any known model may appear in guardrails; escalation ordering uses the
+# general coding family only.
+TIER_RANK = dict(MASTER_RANK)
 EFFORT_RANK = {name: index for index, name in enumerate(EFFORTS)}
 
 CWD_RX = re.compile(r"<cwd>\s*(.*?)\s*</cwd>", re.S | re.I)
@@ -332,7 +330,7 @@ def enrich_jev_state(
     session: Dict[str, Any] = {"failure_streak": failure_streak}
     previous_model = previous.get("last_model")
     previous_effort = previous.get("last_effort")
-    if previous_model in TIERS:
+    if previous_model in MASTER_RANK:
         session["previous_model"] = previous_model
     if previous_effort in EFFORT_RANK:
         session["previous_effort"] = previous_effort
@@ -373,6 +371,7 @@ def apply_guardrails(
     step: Dict[str, Any],
     previous: Dict[str, Any],
     failure_streak: int,
+    ladder=None,
 ):
     """Apply bounded, evidence-based floors after Jev's joint decision.
 
@@ -415,9 +414,12 @@ def apply_guardrails(
             chosen_model, chosen_effort = raised_model, raised_effort
             reasons.append(f"failure_floor_{failure_streak}")
 
+    active_ladder = list(ladder) if ladder else list(GENERAL_ORDER)
+    ladder_rank = {name: index for index, name in enumerate(active_ladder)}
     if step.get("step_type") == "user_turn" and is_short_followup(task):
-        if previous_model in TIER_RANK and TIER_RANK[previous_model] - TIER_RANK[chosen_model] > 1:
-            chosen_model = _one_step_below(previous_model, TIERS, TIER_RANK)
+        if (previous_model in ladder_rank and chosen_model in ladder_rank
+                and ladder_rank[previous_model] - ladder_rank[chosen_model] > 1):
+            chosen_model = _one_step_below(previous_model, active_ladder, ladder_rank)
             reasons.append("continuation_model_hysteresis")
         if previous_effort in EFFORT_RANK and EFFORT_RANK[previous_effort] - EFFORT_RANK[chosen_effort] > 1:
             chosen_effort = _one_step_below(previous_effort, EFFORTS, EFFORT_RANK)

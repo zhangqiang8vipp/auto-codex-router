@@ -339,7 +339,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "dv.policy":"Policy: KEEP by default; REPLAN only on evidence.","dv.chain":"Decision chain",
     "dv.current":"current","dv.available":"available","dv.planned":"planned",
     "md.tiers":"Model tiers","md.efforts":"Reasoning levels","md.catalog":"Execution models",
-    "md.special":"special / other","md.specialnote":"not on the auto-decision menu","md.default":"default","md.hidden":"hidden from picker","md.routable":"decision can pick","md.notroutable":"not auto-picked",
+    "md.general":"General models","md.special":"special / other","md.specialnote":"not on the auto-decision menu","md.default":"default","md.hidden":"hidden from picker","md.routable":"decision can pick","md.notroutable":"not auto-picked",
     "md.disabled":"disabled","roster.allow":"Whitelist","roster.deny":"Blacklist",
     "roster.hint":"Whitelist = available for work, blacklist = disabled from selection. Takes effect immediately.",
     "ac.title":"Live activity","ac.time":"Time","ac.model":"Model","ac.source":"Source",
@@ -360,7 +360,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "dv.policy":"策略：默认保持（KEEP），只有出现证据才重新规划（REPLAN）。","dv.chain":"决策链",
     "dv.current":"当前","dv.available":"可用","dv.planned":"计划中",
     "md.tiers":"模型挡位","md.efforts":"推理强度","md.catalog":"最终干活模型",
-    "md.special":"特殊 / 其他","md.specialnote":"以下不参与自动抉择","md.default":"默认","md.hidden":"不在选择器显示","md.routable":"可抉择","md.notroutable":"不参与自动抉择",
+    "md.general":"通用模型","md.special":"特殊 / 其他","md.specialnote":"以下不参与自动抉择","md.default":"默认","md.hidden":"不在选择器显示","md.routable":"可抉择","md.notroutable":"不参与自动抉择",
     "md.disabled":"已禁用","roster.allow":"白名单","roster.deny":"黑名单",
     "roster.hint":"白名单＝可干活，黑名单＝禁用选择；实时生效。",
     "ac.title":"实时活动","ac.time":"时间","ac.model":"模型","ac.source":"来源",
@@ -486,14 +486,14 @@ PANEL_HTML = r'''<!DOCTYPE html>
     // tiers
     $("tierCards").innerHTML=c.tiers.map(function(tx){
       return '<div class="tierc"><span class="rank">#'+tx.rank+'</span><b class="mono">'+
-        esc(tierShort(tx.id))+'</b><p>'+esc(txProfile(tx.id,tx.profile))+'</p></div>';}).join("");
+        esc(tierShort(tx.id))+'</b><p>'+esc(modelDesc(tx.id,tx.profile))+'</p></div>';}).join("");
     // efforts
     $("effChips").innerHTML=c.efforts.map(function(e){
       return '<span class="eff mono">'+e.id+'<small>'+esc(effProfile(e.id,e.profile))+'</small></span>';}).join("");
     // catalog groups
     var html="";
     c.execution.forEach(function(g){
-      var title=g.tier==="special"?t("md.special"):esc(tierShort(g.tier));
+      var title=g.tier==="special"?t("md.special"):t("md.general");
       var gnote=g.tier==="special"?'<span style="font-size:11px;font-weight:400;" class="muted">'+t("md.specialnote")+'</span>':"";
       html+='<div class="group"><h3><span class="ranktag">'+title+'</span>'+gnote+'</h3>';
       html+='<div class="models">'+g.models.map(function(m){
