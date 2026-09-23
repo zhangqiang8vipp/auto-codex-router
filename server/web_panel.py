@@ -105,12 +105,6 @@ PANEL_HTML = r'''<!DOCTYPE html>
   .pill.on{background:rgba(52,199,89,.15);color:#248a3d;} .pill.off{background:#e9e9eb;color:var(--muted);}
   .pill.ok{background:rgba(52,199,89,.14);color:#248a3d;} .pill.no{background:#e9e9eb;color:var(--muted);}
   .pill.deny{background:rgba(255,59,48,.14);color:#d70015;}
-  .rosterctl{display:flex;gap:6px;margin-top:12px;}
-  .rc{flex:1;padding:7px 10px;border-radius:9px;border:1px solid var(--line);background:var(--panel);
-    font-size:12px;font-weight:600;color:var(--text);cursor:pointer;transition:background .15s,color .15s;}
-  .rc.allow.active{background:var(--green);border-color:var(--green);color:#fff;}
-  .rc.deny.active{background:#ff3b30;border-color:#ff3b30;color:#fff;}
-  .rc:disabled{opacity:.5;cursor:default;}
   .kv{display:grid;grid-template-columns:auto 1fr;gap:8px 14px;margin:0;}
   .kv dt{color:var(--muted);} .kv dd{margin:0;font-weight:600;}
   .mono{font-family:ui-monospace,Consolas,monospace;}
@@ -129,20 +123,41 @@ PANEL_HTML = r'''<!DOCTYPE html>
   .effchips{display:flex;flex-wrap:wrap;gap:8px;}
   .eff{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:7px 11px;font-size:12px;}
   .eff small{display:block;color:var(--muted);font-size:11px;}
-  /* catalog */
-  .group{margin-bottom:18px;}
+  /* catalog — family-grouped compact list */
+  .group{margin-bottom:16px;}
   .group>h3{font-size:14px;margin:0 0 9px;display:flex;align-items:center;gap:9px;}
   .group>h3 .ranktag{background:var(--panel2);border:1px solid var(--line);border-radius:7px;
     font-size:11px;padding:2px 8px;color:var(--muted);}
-  .models{display:grid;grid-template-columns:1fr 1fr;gap:11px;}
-  .mcard{background:var(--panel2);border:1px solid var(--line);border-radius:11px;padding:13px 14px;}
-  .mcard .mh{display:flex;align-items:center;gap:8px;margin-bottom:4px;}
-  .mcard .mh b{font-size:14px;}
-  .mcard p{margin:0 0 9px;font-size:12px;color:var(--muted);}
+  .famhead{display:flex;align-items:baseline;gap:9px;margin:17px 0 7px;font-size:12px;font-weight:700;
+    letter-spacing:.04em;text-transform:uppercase;color:var(--text);}
+  .famhead:first-child{margin-top:2px;}
+  .famhead .famn{color:var(--muted);font-weight:500;text-transform:none;letter-spacing:0;font-size:11px;}
+  .mrows{display:flex;flex-direction:column;gap:7px;}
+  .mrow{background:var(--panel2);border:1px solid var(--line);border-radius:11px;overflow:hidden;}
+  .mrow.sel{border-color:rgba(52,199,89,.55);background:rgba(52,199,89,.07);}
+  .mrow.den{opacity:.6;}
+  .mrow-head{display:flex;align-items:center;gap:10px;padding:9px 12px;}
+  .mrow-head.is-toggle{cursor:pointer;}
+  .mrow-head.is-toggle:hover{background:rgba(0,0,0,.03);}
+  .expander{flex:0 0 auto;width:20px;height:20px;border:none;background:none;color:var(--muted);cursor:pointer;
+    display:grid;place-items:center;font-size:9px;transition:transform .18s;border-radius:6px;padding:0;}
+  .expander.open{transform:rotate(90deg);}
+  .mname{font-size:13px;font-weight:700;white-space:nowrap;}
+  .mtag{font-size:10px;padding:1px 7px;border-radius:999px;font-weight:600;white-space:nowrap;}
+  .mtag.hide{background:#e9e9eb;color:var(--muted);}
+  .mdesc{flex:1;min-width:0;font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+  .mrow-detail{padding:0 12px 12px 42px;}
+  .mrow-detail p{margin:0 0 8px;font-size:12px;color:var(--muted);}
   .mchips{display:flex;flex-wrap:wrap;gap:5px;}
   .mchip{font-size:11px;padding:2px 7px;border-radius:6px;background:#ececf0;color:var(--muted);
     font-family:ui-monospace,Consolas,monospace;}
   .mchip.def{background:rgba(0,122,255,.12);color:var(--accent);}
+  .rosterctl{display:inline-flex;background:#e9e9eb;border-radius:8px;padding:2px;gap:2px;flex:0 0 auto;}
+  .rc{border:none;background:none;padding:4px 11px;border-radius:6px;font-size:11px;font-weight:600;
+    color:var(--muted);cursor:pointer;transition:background .15s,color .15s;white-space:nowrap;}
+  .rc.allow.active{background:var(--green);color:#fff;}
+  .rc.deny.active{background:#ff3b30;color:#fff;}
+  .rc:disabled{opacity:.55;cursor:default;}
   /* chain */
   .chain{display:flex;flex-direction:column;gap:9px;}
   .chainrow{display:flex;align-items:center;gap:11px;background:var(--panel2);border:1px solid var(--line);
@@ -340,6 +355,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "dv.current":"current","dv.available":"available","dv.planned":"planned",
     "md.tiers":"Model tiers","md.efforts":"Reasoning levels","md.catalog":"Execution models",
     "md.general":"General models","md.special":"special / other","md.specialnote":"not on the auto-decision menu","md.default":"default","md.hidden":"hidden from picker","md.routable":"decision can pick","md.notroutable":"not auto-picked",
+    "md.famcur":"current generation","md.famprev":"previous generation","md.famother":"GPT-5 / Other","md.famothernote":"older general models",
     "md.disabled":"disabled","roster.allow":"Whitelist","roster.deny":"Blacklist",
     "roster.hint":"Whitelist = available for work, blacklist = disabled from selection. Takes effect immediately.",
     "ac.title":"Live activity","ac.time":"Time","ac.model":"Model","ac.source":"Source",
@@ -361,6 +377,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "dv.current":"当前","dv.available":"可用","dv.planned":"计划中",
     "md.tiers":"模型挡位","md.efforts":"推理强度","md.catalog":"最终干活模型",
     "md.general":"通用模型","md.special":"特殊 / 其他","md.specialnote":"以下不参与自动抉择","md.default":"默认","md.hidden":"不在选择器显示","md.routable":"可抉择","md.notroutable":"不参与自动抉择",
+    "md.famcur":"当前代","md.famprev":"上一代","md.famother":"GPT-5 / 其他","md.famothernote":"更早的通用模型",
     "md.disabled":"已禁用","roster.allow":"白名单","roster.deny":"黑名单",
     "roster.hint":"白名单＝可干活，黑名单＝禁用选择；实时生效。",
     "ac.title":"实时活动","ac.time":"时间","ac.model":"模型","ac.source":"来源",
@@ -490,25 +507,48 @@ PANEL_HTML = r'''<!DOCTYPE html>
     // efforts
     $("effChips").innerHTML=c.efforts.map(function(e){
       return '<span class="eff mono">'+e.id+'<small>'+esc(effProfile(e.id,e.profile))+'</small></span>';}).join("");
-    // catalog groups
+    // catalog groups — family-grouped compact rows
+    function effortChips(m){
+      return m.efforts.map(function(e){
+        return '<span class="mchip'+(e.effort===m.default_effort?" def":"")+'">'+e.effort+
+          (e.effort===m.default_effort?" · "+t("md.default"):"")+'</span>';}).join("");
+    }
+    function modelRow(m){
+      var cls=m.roster==="allow"?" sel":(m.roster==="deny"?" den":"");
+      var toggleable=(m.selectable||m.routable);
+      var ctl=toggleable?rosterControl(m)
+        :'<span class="rosterctl"><button type="button" class="rc" disabled>'+t("md.notroutable")+'</button></span>';
+      var headCls=toggleable?'mrow-head is-toggle':'mrow-head';
+      var headAttrs=toggleable?' data-slug="'+esc(m.slug)+'" data-roster="'+(m.roster||"")+'"':"";
+      var hidden=m.visibility=="hide"?'<span class="mtag hide">'+t("md.hidden")+'</span>':"";
+      return '<div class="mrow'+cls+'"><div class="'+headCls+'"'+headAttrs+'>'+
+        '<button type="button" class="expander" aria-expanded="false">▶</button>'+
+        '<span class="mname mono">'+esc(m.name)+'</span>'+hidden+
+        '<span class="mdesc">'+esc(modelDesc(m.slug,m.description))+'</span>'+ctl+
+        '</div><div class="mrow-detail" hidden><p>'+esc(modelDesc(m.slug,m.description))+'</p>'+
+        '<div class="mchips">'+effortChips(m)+'</div></div></div>';
+    }
+    function famOf(slug){
+      if(slug.indexOf("gpt-6")===0)return "GPT-6";
+      if(slug.indexOf("gpt-5.6")===0)return "GPT-5.6";
+      return "other";
+    }
     var html="";
     c.execution.forEach(function(g){
-      var title=g.tier==="special"?t("md.special"):t("md.general");
-      var gnote=g.tier==="special"?'<span style="font-size:11px;font-weight:400;" class="muted">'+t("md.specialnote")+'</span>':"";
-      html+='<div class="group"><h3><span class="ranktag">'+title+'</span>'+gnote+'</h3>';
-      html+='<div class="models">'+g.models.map(function(m){
-        var chips=m.efforts.map(function(e){
-          return '<span class="mchip'+(e.effort===m.default_effort?" def":"")+'">'+e.effort+
-            (e.effort===m.default_effort?" · "+t("md.default"):"")+'</span>';}).join("");
-        var rb;
-        if(m.selectable){rb='<span class="pill ok">'+t("md.routable")+'</span>';}
-        else if(m.routable){rb='<span class="pill deny">'+t("md.disabled")+'</span>';}
-        else{rb='<span class="pill no">'+t("md.notroutable")+'</span>';}
-        var hidden=m.visibility=="hide"?'<span class="pill off">'+t("md.hidden")+'</span>':"";
-        return '<div class="mcard"><div class="mh"><b>'+esc(m.name)+'</b>'+rb+hidden+'</div><p>'+
-          esc(modelDesc(m.slug,m.description))+'</p><div class="mchips">'+chips+'</div>'+
-          rosterControl(m)+'</div>';
-      }).join("")+'</div></div>';
+      if(g.tier==="special"){
+        html+='<div class="famhead">'+t("md.special")+'<span class="famn">'+t("md.specialnote")+'</span></div>';
+        html+='<div class="mrows">'+g.models.map(modelRow).join("")+'</div>';
+        return;
+      }
+      var buckets={"GPT-6":[],"GPT-5.6":[],"other":[]};
+      g.models.forEach(function(m){buckets[famOf(m.slug)].push(m);});
+      var famMeta=[["GPT-6",t("md.famcur")],["GPT-5.6",t("md.famprev")],["other",t("md.famothernote")]];
+      famMeta.forEach(function(meta){
+        var arr=buckets[meta[0]]; if(!arr.length)return;
+        var title=meta[0]==="other"?t("md.famother"):meta[0];
+        html+='<div class="famhead">'+title+'<span class="famn">'+meta[1]+'</span></div>';
+        html+='<div class="mrows">'+arr.map(modelRow).join("")+'</div>';
+      });
     });
     $("catalogGroups").innerHTML=html;
     // decision
@@ -581,20 +621,41 @@ PANEL_HTML = r'''<!DOCTYPE html>
         $("keyNote").textContent=t("flight");});
   });
 
-  $("catalogGroups").addEventListener("click",function(ev){
-    var btn=ev.target.closest?ev.target.closest(".rc"):null; if(!btn)return;
-    var ctl=btn.parentNode, slug=ctl.getAttribute("data-slug"), state=btn.getAttribute("data-state");
-    if(btn.classList.contains("active"))return;
-    ctl.querySelectorAll(".rc").forEach(function(b){b.disabled=true;});
+  function postRoster(slug,state,ctl){
+    if(ctl){ctl.querySelectorAll(".rc").forEach(function(b){b.disabled=true;});}
     fetch("/control/roster",{method:"POST",headers:{"Content-Type":"application/json"},
       body:JSON.stringify({slug:slug,state:state})})
       .then(function(r){return r.json().then(function(j){return{ok:r.ok,j:j};});})
       .then(function(res){
         if(res.ok){return fetch("/control/catalog").then(function(r){return r.json();}).then(renderCatalog);}
-        ctl.querySelectorAll(".rc").forEach(function(b){b.disabled=false;});
+        if(ctl){ctl.querySelectorAll(".rc").forEach(function(b){b.disabled=false;});}
         window.alert((res.j.error&&res.j.error.message)||t("flight"));
       })
-      .catch(function(){ctl.querySelectorAll(".rc").forEach(function(b){b.disabled=false;});});
+      .catch(function(){if(ctl){ctl.querySelectorAll(".rc").forEach(function(b){b.disabled=false;});}});
+  }
+  $("catalogGroups").addEventListener("click",function(ev){
+    var exp=ev.target.closest?ev.target.closest(".expander"):null;
+    if(exp){
+      var det=exp.closest(".mrow").querySelector(".mrow-detail");
+      var willOpen=det.hidden; det.hidden=!willOpen;
+      exp.classList.toggle("open",willOpen);
+      exp.setAttribute("aria-expanded",String(willOpen));
+      return;
+    }
+    var btn=ev.target.closest?ev.target.closest(".rc"):null;
+    if(btn){
+      var ctl=btn.parentNode, slug=ctl.getAttribute("data-slug"), state=btn.getAttribute("data-state");
+      if(btn.classList.contains("active"))return;
+      postRoster(slug,state,ctl);
+      return;
+    }
+    var head=ev.target.closest?ev.target.closest(".mrow-head.is-toggle"):null;
+    if(head){
+      var rslug=head.getAttribute("data-slug");
+      var target=head.getAttribute("data-roster")==="allow"?"deny":"allow";
+      var rowCtl=head.closest(".mrow").querySelector(".rosterctl");
+      postRoster(rslug,target,rowCtl);
+    }
   });
 
   localize();refresh();
