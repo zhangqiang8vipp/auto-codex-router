@@ -44,6 +44,8 @@ def recent_records(log_path: str, limit: int = RECENT_LIMIT):
             "reason": rec.get("lease_reason"),
             "status": rec.get("status"),
             "step": rec.get("step"),
+            "tool": rec.get("tool"),
+            "compacted": bool(rec.get("compacted")),
             "task": (str(rec.get("task") or "")[:80]),
         })
     return records[-limit:]
@@ -158,6 +160,15 @@ PANEL_HTML = r'''<!DOCTYPE html>
   .rc.allow.active{background:var(--green);color:#fff;}
   .rc.deny.active{background:#ff3b30;color:#fff;}
   .rc:disabled{opacity:.55;cursor:default;}
+  .atask{min-width:200px;}
+  .akind{display:inline-block;font-size:10px;font-weight:700;padding:1px 7px;border-radius:999px;
+    margin-right:7px;vertical-align:middle;background:#e9e9eb;color:var(--muted);white-space:nowrap;}
+  .akind-user{background:rgba(0,122,255,.14);color:var(--accent);}
+  .akind-tool{background:rgba(100,100,120,.16);color:#4a4a55;}
+  .akind-compaction{background:rgba(255,149,0,.16);color:#b25a00;}
+  .akind-subresume{background:rgba(175,82,222,.16);color:#8a3eb8;}
+  .akind-context{background:rgba(90,200,250,.18);color:#1a7fa8;}
+  .alabel{vertical-align:middle;font-size:12px;}
   /* chain */
   .chain{display:flex;flex-direction:column;gap:9px;}
   .chainrow{display:flex;align-items:center;gap:11px;background:var(--panel2);border:1px solid var(--line);
@@ -360,6 +371,9 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "roster.hint":"Whitelist = available for work, blacklist = disabled from selection. Takes effect immediately.",
     "ac.title":"Live activity","ac.time":"Time","ac.model":"Model","ac.source":"Source",
     "ac.status":"Status","ac.task":"Task","ac.none":"No activity yet.",
+    "ac.k.user":"User","ac.k.tool":"Tool","ac.k.compaction":"Compact","ac.k.subresume":"Subtask",
+    "ac.k.context":"Context","ac.k.other":"Other","ac.toolstep":"tool step","ac.compaction":"Context compaction",
+    "ac.subresume":"Subtask continuation","ac.context":"Rules / context injection",
     "ks.title":"Keys","ks.key":"Key","ks.layer":"Layer","ks.state":"State","ks.decision":"decision",
     "ks.provider":"provider","ks.value":"Paste key","ks.save":"Save","ks.note":"Keys are stored locally and never logged.",
     "ks.configured":"configured","ks.missing":"missing","ks.saved":"Saved.","flight":"Routing in flight; retry shortly.",
@@ -382,6 +396,9 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "roster.hint":"白名单＝可干活，黑名单＝禁用选择；实时生效。",
     "ac.title":"实时活动","ac.time":"时间","ac.model":"模型","ac.source":"来源",
     "ac.status":"状态","ac.task":"任务","ac.none":"暂无活动。",
+    "ac.k.user":"用户","ac.k.tool":"工具","ac.k.compaction":"压缩","ac.k.subresume":"子任务",
+    "ac.k.context":"上下文","ac.k.other":"其他","ac.toolstep":"工具步骤","ac.compaction":"上下文压缩",
+    "ac.subresume":"子任务续跑","ac.context":"规则 / 上下文注入",
     "ks.title":"密钥","ks.key":"密钥","ks.layer":"层级","ks.state":"状态","ks.decision":"决策",
     "ks.provider":"供应商","ks.value":"粘贴密钥","ks.save":"保存","ks.note":"密钥仅保存在本地，不会被记录。",
     "ks.configured":"已配置","ks.missing":"未配置","ks.saved":"已保存。","flight":"有路由请求进行中，请稍后再试。",
@@ -501,11 +518,11 @@ PANEL_HTML = r'''<!DOCTYPE html>
   function renderCatalog(c){
     catalog=c;
     // tiers
-    $("tierCards").innerHTML=c.tiers.map(function(tx){
+    $("tierCards").innerHTML=(c.tiers||[]).map(function(tx){
       return '<div class="tierc"><span class="rank">#'+tx.rank+'</span><b class="mono">'+
         esc(tierShort(tx.id))+'</b><p>'+esc(modelDesc(tx.id,tx.profile))+'</p></div>';}).join("");
     // efforts
-    $("effChips").innerHTML=c.efforts.map(function(e){
+    $("effChips").innerHTML=(c.efforts||[]).map(function(e){
       return '<span class="eff mono">'+e.id+'<small>'+esc(effProfile(e.id,e.profile))+'</small></span>';}).join("");
     // catalog groups — family-grouped compact rows
     function effortChips(m){
@@ -534,7 +551,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
       return "other";
     }
     var html="";
-    c.execution.forEach(function(g){
+    (c.execution||[]).forEach(function(g){
       if(g.tier==="special"){
         html+='<div class="famhead">'+t("md.special")+'<span class="famn">'+t("md.specialnote")+'</span></div>';
         html+='<div class="mrows">'+g.models.map(modelRow).join("")+'</div>';
@@ -572,18 +589,43 @@ PANEL_HTML = r'''<!DOCTYPE html>
       return '<option value="'+k.kind+'">'+k.env+'</option>';}).join("");
   }
 
+  function activityKind(r){
+    var t0=r.task||"";
+    if(r.compacted||/CONTEXT CHECKPOINT COMPACTION|handoff summary for another/i.test(t0))return "compaction";
+    if(/Another language model started|summary of its thinking|Continue from where it left off/i.test(t0))return "subresume";
+    if(/^#\s*(AGENTS\.md|Overview)|<INSTRUCTIONS>/.test(t0))return "context";
+    if(r.step==="tool_step")return "tool";
+    if(r.step==="user_turn")return "user";
+    return "other";
+  }
+  function activityLabel(r,k){
+    if(k==="tool")return (r.tool||t("ac.toolstep"));
+    if(k==="compaction")return t("ac.compaction");
+    if(k==="subresume")return t("ac.subresume");
+    if(k==="context")return t("ac.context");
+    if(k==="user")return (r.task||"");
+    return r.reason?reasonLabel(r.reason):(r.task||"");
+  }
   function renderRecent(rows){
     recentRows=rows;
     var tb=$("actBody");
     if(!rows||!rows.length){tb.innerHTML='<tr><td colspan="5" class="muted">'+t("ac.none")+'</td></tr>';return;}
     tb.innerHTML=rows.slice().reverse().map(function(r){
       var cls=r.status===200?"st-200":"st-other";
+      var k=activityKind(r);
+      var cell='<span class="akind akind-'+k+'">'+t("ac.k."+k)+'</span>'+
+        '<span class="alabel" title="'+esc(r.task||"")+'">'+esc(activityLabel(r,k))+'</span>';
       return '<tr><td class="tag muted">'+(r.at||"")+'</td><td class="tag">'+shortModel(r.model)+
         (r.effort?" · "+r.effort:"")+'</td><td class="tag">'+sourceLabel(r.source)+'</td><td class="tag '+
-        cls+'">'+(r.status==null?"—":r.status)+'</td><td>'+esc(r.task)+'</td></tr>';}).join("");
+        cls+'">'+(r.status==null?"—":r.status)+'</td><td class="atask">'+cell+'</td></tr>';}).join("");
   }
 
-  function renderAll(){if(status)renderStatus(status);if(catalog)renderCatalog(catalog);if(recentRows)renderRecent(recentRows);}
+  function safe(fn){try{fn();}catch(e){}}
+  function renderAll(){
+    if(status)safe(function(){renderStatus(status);});
+    if(catalog)safe(function(){renderCatalog(catalog);});
+    if(recentRows)safe(function(){renderRecent(recentRows);});
+  }
 
   function refresh(){
     fetch("/control/status").then(function(r){return r.json();})

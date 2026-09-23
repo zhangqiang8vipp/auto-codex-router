@@ -2362,6 +2362,8 @@ class Handler(BaseHTTPRequestHandler):
             "img": signals.get("has_image"),
             "step": step["step_type"],
             "errored": step["errored"],
+            "tool": ((step.get("tool_call") or {}).get("name") or None),
+            "compacted": bool(compacted),
             "digest_len": len(step["digest"]),
             "smart_gate": smart_gate,
             "failure_streak": failure_streak,
