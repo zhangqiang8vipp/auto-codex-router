@@ -35,20 +35,18 @@ For a checked-out development tree, the lower-level installer remains:
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\setup-local.ps1 -RouterDir "C:\absolute\path\to\codex-router"
 ```
 
-The Windows installer registers three per-user Scheduled Tasks:
+The Windows installer registers two per-user Scheduled Tasks:
 
 - `Jev Codex Router`: hidden background service, starts at logon and has a
   one-minute heartbeat with `IgnoreNew`.
 - `Jev Codex Router Shadow Eval`: daily 03:15 rolling 7-day report with
   `StartWhenAvailable`.
-- `Jev Codex Auto Toggle`: a small WPF/UIAutomation overlay anchored beside
-  Codex's native reasoning control.
 
 It then registers the loopback generic Responses provider, discovers/curates
 `jev/auto`, enables Codex Router signed routing, and leaves Codex's native
-model + reasoning picker as the manual UI. The Auto button only changes Codex
-Router's `native-redirect`: OFF restores the previous redirect (normally
-native ChatGPT), ON sends native GPT calls to `jev/auto`.
+model + reasoning picker as the manual UI. Auto is switched from the local
+control panel at http://127.0.0.1:4319/: OFF restores the previous redirect
+(normally native ChatGPT), ON sends native GPT calls to `jev/auto`.
 
 ### macOS
 
@@ -66,7 +64,6 @@ bash setup-local.sh /absolute/path/to/codex-router
 | Shadow report now | `py -3 server\report_shadow_eval.py --days 7 --write` |
 | Service status | `Get-ScheduledTask -TaskName "Jev Codex Router"` |
 | Eval status | `Get-ScheduledTask -TaskName "Jev Codex Router Shadow Eval"` |
-| Auto toggle status | `Get-ScheduledTask -TaskName "Jev Codex Auto Toggle"` |
 | Auto router status | `Invoke-RestMethod http://127.0.0.1:4319/control/status` |
 | Restart service | `Stop-ScheduledTask -TaskName "Jev Codex Router"; Start-ScheduledTask -TaskName "Jev Codex Router"` |
 | Uninstall all Jev tasks | `.\server\uninstall-service.ps1` |
@@ -165,11 +162,9 @@ macOS, then verify:
 
 ## Troubleshooting
 
-- **Auto button does not appear**: verify
-  `Get-ScheduledTask -TaskName "Jev Codex Auto Toggle"`, then verify
-  `Invoke-RestMethod http://127.0.0.1:4319/control/status`. If both work,
-  Codex may have changed the UIAutomation name/layout of its reasoning control;
-  the overlay intentionally hides rather than attaching to an uncertain target.
+- **Switching Auto**: use the local control panel at http://127.0.0.1:4319/
+  (or `POST /control/auto` with a boolean), then verify with
+  `Invoke-RestMethod http://127.0.0.1:4319/control/status`.
 - **Auto is green but a native picker choice seems ignored**: this is expected.
   While Auto is ON, native GPT traffic is redirected to `jev/auto`. Turn Auto
   OFF before using Codex's native model/reasoning selection manually.

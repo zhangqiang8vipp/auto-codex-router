@@ -2,7 +2,6 @@
 param(
   [string]$TaskName = "Jev Codex Router",
   [string]$EvalTaskName = "Jev Codex Router Shadow Eval",
-  [string]$ToggleTaskName = "Jev Codex Auto Toggle",
   [string]$StateDir = ""
 )
 
@@ -15,7 +14,7 @@ try {
   Write-Warning "Could not switch Auto off before uninstall. If native redirect stays active, clear it from Codex Router manually."
 }
 
-foreach ($name in @($ToggleTaskName, $EvalTaskName, $TaskName)) {
+foreach ($name in @($EvalTaskName, $TaskName)) {
   $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
   if ($task) {
     try { Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue } catch {}
@@ -30,8 +29,4 @@ if ([string]::IsNullOrWhiteSpace($StateDir)) {
   } else {
     Join-Path $HOME ".codex\codex-router"
   }
-}
-$toggleDir = Join-Path ([IO.Path]::GetFullPath($StateDir)) "jev-auto-toggle"
-if (Test-Path -LiteralPath $toggleDir) {
-  Remove-Item -LiteralPath $toggleDir -Recurse -Force -ErrorAction SilentlyContinue
 }

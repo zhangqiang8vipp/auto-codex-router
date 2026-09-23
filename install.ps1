@@ -538,7 +538,7 @@ function Ensure-JevKeyFile([string]$Explicit) {
 }
 
 function Stop-ExistingJevTasks {
-  foreach ($name in @("Jev Codex Auto Toggle", "Jev Codex Router")) {
+  foreach ($name in @("Jev Codex Router")) {
     try {
       if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
         Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
@@ -549,7 +549,7 @@ function Stop-ExistingJevTasks {
 }
 
 function Start-ExistingJevTasks {
-  foreach ($name in @("Jev Codex Router", "Jev Codex Auto Toggle")) {
+  foreach ($name in @("Jev Codex Router")) {
     try {
       if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
         Start-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
