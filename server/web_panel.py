@@ -341,6 +341,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
         <table>
           <thead><tr>
             <th data-i18n="se.session">Session</th>
+            <th data-i18n="se.kind">Kind</th>
             <th data-i18n="se.requested">Requested</th>
             <th data-i18n="se.served">Actual served</th>
             <th data-i18n="se.state">State</th>
@@ -402,9 +403,10 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "page.activity":"Live Activity","page.keys":"Keys",
     "nav.sessions":"Sessions","page.sessions":"Sessions",
     "se.title":"Sessions","se.hint":"Requested model vs the model the upstream actually served. A red chip marks a mismatch.",
-    "se.session":"Session","se.requested":"Requested","se.served":"Actual served","se.state":"State",
+    "se.session":"Session","se.kind":"Kind","se.requested":"Requested","se.served":"Actual served","se.state":"State",
     "se.requests":"Requests","se.last":"Last active","se.match":"Consistent","se.mismatch":"Mismatch",
-    "se.active":"active","se.none":"No sessions yet."},
+    "se.active":"active","se.none":"No sessions yet.",
+    "kind.main":"Main turn","kind.subagent":"Subagent","kind.background":"Background"},
   zh:{"brand":"自动 Codex 路由","brandSub":"会话感知运行时","nav.overview":"总览",
     "nav.decision":"决策层","nav.models":"模型名单","nav.activity":"实时活动","nav.keys":"密钥",
     "healthy":"服务正常","ov.auto":"自动路由","ov.current":"当前路由","ov.model":"模型",
@@ -432,9 +434,10 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "page.activity":"实时活动","page.keys":"密钥",
     "nav.sessions":"会话","page.sessions":"会话",
     "se.title":"会话","se.hint":"请求的模型 vs 上游实际服务的模型；红色标记表示出现不一致。",
-    "se.session":"会话","se.requested":"请求模型","se.served":"实际模型","se.state":"状态",
+    "se.session":"会话","se.kind":"类型","se.requested":"请求模型","se.served":"实际模型","se.state":"状态",
     "se.requests":"请求数","se.last":"最后活跃","se.match":"一致","se.mismatch":"不一致",
-    "se.active":"活跃","se.none":"暂无会话。"}
+    "se.active":"活跃","se.none":"暂无会话。",
+    "kind.main":"主回合","kind.subagent":"子智能体","kind.background":"后台"}
   };
   var lang=(navigator.language||"en").toLowerCase().indexOf("zh")===0?"zh":"en";
   var catalog=null,status=null,busy=false,recentRows=null;
@@ -670,7 +673,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
   }
   function renderSessions(d){
     var body=$("seBody"); var list=(d&&d.sessions)||[];
-    if(!list.length){body.innerHTML='<tr><td colspan="6" style="color:#8a8f98;">'+esc(t("se.none"))+'</td></tr>';return;}
+    if(!list.length){body.innerHTML='<tr><td colspan="7" style="color:#8a8f98;">'+esc(t("se.none"))+'</td></tr>';return;}
     var rows="";
     list.forEach(function(s){
       var requested=s.requested||"—", served=s.served||"—";
@@ -679,11 +682,19 @@ PANEL_HTML = r'''<!DOCTYPE html>
       if(!s.served){chip='<span style="background:#e9edf3;color:#6a7078;border-radius:999px;padding:2px 9px;font-size:11px;font-weight:600;">'+esc(t("se.active"))+'</span>';}
       else if(mismatch){chip='<span title="'+esc((s.mismatches&&s.mismatches[0]&&s.mismatches[0].at)||"")+'" style="background:#fde4e4;color:#d24b4b;border-radius:999px;padding:2px 9px;font-size:11px;font-weight:600;">'+esc(t("se.mismatch"))+'</span>';}
       else{chip='<span style="background:#e3f4ea;color:#248a54;border-radius:999px;padding:2px 9px;font-size:11px;font-weight:600;">'+esc(t("se.match"))+'</span>';}
+      var kindKey=s.kind==="main"?"kind.main":(s.kind==="subagent"?"kind.subagent":"kind.background");
+      var kindStyle=s.kind==="main"
+        ?"background:#e7eefc;color:#2b6cb0;"
+        :(s.kind==="subagent"
+          ?"background:#f0ecfb;color:#6b46c1;"
+          :"background:#f3f0e8;color:#8a6d3b;");
+      var kindBadge='<span title="'+esc(s.agentName||"")+'" style="'+kindStyle+'border-radius:999px;padding:2px 9px;font-size:11px;font-weight:600;">'+esc(t(kindKey))+'</span>';
       var servedCell=esc(shortModel(served));
       if(mismatch&&s.mismatches&&s.mismatches[0]){servedCell+='<div style="font-size:10px;color:#d24b4b;">'+esc(relTime(s.mismatches[0].at))+'</div>';}
       var sid=esc(String(s.id).slice(0,12));
       rows+='<tr'+(s.active?' style="background:#f6f8fb;"':"")+'>'
         +'<td class="mono" title="'+esc(s.id)+'">'+sid+'</td>'
+        +'<td>'+kindBadge+'</td>'
         +'<td class="mono">'+esc(shortModel(requested))+'</td>'
         +'<td class="mono">'+servedCell+'</td>'
         +'<td>'+chip+'</td>'
