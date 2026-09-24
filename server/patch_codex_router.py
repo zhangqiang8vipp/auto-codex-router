@@ -44,6 +44,17 @@ QUOTA_PASSTHROUGH_SENTINEL = "jev-native-quota-pass-through"
 MARKER_NAME = "jev-exact-native-route.json"
 MARKER_VERSION = 2
 
+# --- Session registry + stealth forward (vendored) ---------------------------
+# Node is the codex-facing chokepoint. These two modules add (a) a per-session
+# view -- requested vs actually served model, with main/subagent/background
+# labels -- and (b) a low-level HTTP/2 "stealth" forward for the auto-off path,
+# so real signed-in Codex traffic leaves the machine exactly as Codex built it.
+# They are vendored into Codex Router's src/ and wired in through narrow,
+# idempotent router.mjs hooks; every anchor is fail-closed and newline-aware.
+SESSION_STEALTH_TAG = "jev-session-stealth-v1"
+VENDORED_MODULES = ("session-registry.mjs", "native-stealth-forward.mjs")
+VENDOR_DIR = Path(__file__).resolve().parent / "vendor"
+
 QUOTA_HELPER = r'''
 function jevNativeQuotaEnvelope(bodyText) {
   const marker = "__JEV_NATIVE_QUOTA_V1__:";
@@ -265,8 +276,8 @@ FORWARDER_PATCHED = r'''    if (lower.startsWith("x-openai-") || lower === "chat
 LITELLM_CFG_REL = ("src", "litellm-config.mjs")
 LITELLM_CFG_ORIGINAL = r'''    "litellm_settings:",
     "  callbacks: [grok_service_tier_callback.grok_service_tier_callback]",
-    "  drop_params": true,
-    "  request_timeout": 600",
+    "  drop_params: true",
+    "  request_timeout: 600",
     "",
 '''
 LITELLM_CFG_PATCHED = r'''    "litellm_settings:",
@@ -352,6 +363,186 @@ def source_supports_exact_native_route(text: str) -> bool:
     return exact_ok and quota_ok and agent_relay_ok
 
 
+# Session + stealth router.mjs hooks (pristine -> patched). Each is detected by
+# its patched form, so re-running is a no-op and a missing/ambiguous pristine
+# anchor fails closed.
+S_N1_ORIGINAL = '''import {
+  activityMetadataFromHeaders,
+  threadIdFromHeaders,
+} from "./codex-session-names.mjs";
+'''
+S_N1_PATCHED = '''import {
+  activityMetadataFromHeaders,
+  threadIdFromHeaders,
+} from "./codex-session-names.mjs";
+// jev-session-stealth-v1
+import * as sessionRegistry from "./session-registry.mjs";
+import { forwardStealthNative } from "./native-stealth-forward.mjs";
+'''
+
+S_N2_ORIGINAL = '''  let requestedModel = "";
+  let route;
+  let upstreamRetries;
+'''
+S_N2_PATCHED = '''  let requestedModel = "";
+  let route;
+  let stealthPassthrough = false;
+  let upstreamRetries;
+'''
+
+S_N3_ORIGINAL = '''    requestedModel = typeof payload.model === "string" ? payload.model : "";
+    let registeredRoute =
+'''
+S_N3_PATCHED = '''    requestedModel = typeof payload.model === "string" ? payload.model : "";
+    // jev-session-stealth-v1
+    const sessionId = sessionRegistry.sessionIdFromRequest(request);
+    sessionRegistry.start(request, requestedModel);
+    let registeredRoute =
+'''
+
+S_N4A_ORIGINAL = '''      const substitutedCaller = callerBroughtNoUpstreamCredential(request);
+      // An extended-window variant is the model it was derived from, published
+'''
+S_N4A_PATCHED = '''      const substitutedCaller = callerBroughtNoUpstreamCredential(request);
+      // jev-session-stealth-v1: a real signed-in Codex turn (not a substituted
+      // harness caller, a compaction, or an exact-route probe) is sent over the
+      // low-level h2 stealth forward so the request leaves this machine exactly
+      // as Codex built it. Everything else keeps the existing native handling.
+      stealthPassthrough =
+        !substitutedCaller &&
+        !compactV1 &&
+        !compactV2 &&
+        !exactRouteProbe &&
+        !nativeContextVariantBase(payload.model);
+      if (stealthPassthrough) {
+        target = nativeTarget(requestUrl.pathname, nativeRequestSearch(requestUrl));
+      } else {
+      // An extended-window variant is the model it was derived from, published
+'''
+
+S_N4B_ORIGINAL = '''      target = nativeTarget(requestUrl.pathname);
+      headers = nativeHeaders(request);
+      routedBody = await compressedNativeBody(
+        Buffer.from(JSON.stringify(native), "utf8"),
+        headers,
+      );
+    }
+'''
+S_N4B_PATCHED = '''      target = nativeTarget(requestUrl.pathname);
+      headers = nativeHeaders(request);
+      routedBody = await compressedNativeBody(
+        Buffer.from(JSON.stringify(native), "utf8"),
+        headers,
+      );
+      }
+    }
+'''
+
+S_N5_ORIGINAL = '''    let { response: upstream, retries } = await fetchWithRetry(
+      target,
+      {
+        method: "POST",
+        headers,
+        body: routedBody,
+        signal: controller.signal,
+      },
+      {
+        // Routed traffic terminates at the local gateway, which has its own
+        // error translation and Retry-After handling below; leave it exactly
+        // as it was.
+        fetchImpl: fetchObservedUpstream,
+        retries: route ? 0 : undefined,
+        canRetry: () => nothingRelayed(response),
+        onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
+      },
+    );
+'''
+S_N5_PATCHED = '''    let upstream;
+    let retries = 0;
+    // jev-session-stealth-v1: the stealth path uses the low-level h2 forward
+    // (original headers + original body); every other path keeps fetchWithRetry.
+    if (stealthPassthrough) {
+      upstream = await forwardStealthNative(target, request, encoded, {
+        signal: controller.signal,
+      });
+    } else {
+      ({ response: upstream, retries } = await fetchWithRetry(
+        target,
+        {
+          method: "POST",
+          headers,
+          body: routedBody,
+          signal: controller.signal,
+        },
+        {
+          // Routed traffic terminates at the local gateway, which has its own
+          // error translation and Retry-After handling below; leave it exactly
+          // as it was.
+          fetchImpl: fetchObservedUpstream,
+          retries: route ? 0 : undefined,
+          canRetry: () => nothingRelayed(response),
+          onRetry: (event) => logUpstreamRetry(event, requestedModel, requestUrl.pathname),
+        },
+      ));
+    }
+'''
+
+S_N6_ORIGINAL = '''        onEvent: (payload) => activity.progress.event(payload),
+'''
+S_N6_PATCHED = '''        onEvent: (payload) => {
+          activity.progress.event(payload);
+          // jev-session-stealth-v1
+          sessionRegistry.observeEvent(sessionId, requestedModel, payload);
+        },
+'''
+
+
+def source_supports_session_stealth(text: str) -> bool:
+    """Whether all session-registry + stealth integration hooks are present."""
+    checks = (
+        'import * as sessionRegistry from "./session-registry.mjs";',
+        'import { forwardStealthNative } from "./native-stealth-forward.mjs";',
+        "let stealthPassthrough = false;",
+        "sessionRegistry.start(request, requestedModel);",
+        "sessionRegistry.observeEvent(sessionId, requestedModel, payload);",
+        "forwardStealthNative(target, request, encoded,",
+    )
+    return all(item in text for item in checks)
+
+
+def write_vendored_modules(router_dir: Path) -> bool:
+    """Copy vendored Node modules into Codex Router src/ idempotently."""
+    changed = False
+    for name in VENDORED_MODULES:
+        src = VENDOR_DIR / name
+        dst = router_dir / "src" / name
+        if not src.is_file():
+            raise PatchError(f"Vendored module missing: {src}")
+        data = src.read_bytes()
+        if dst.is_file():
+            try:
+                if dst.read_bytes() == data:
+                    continue
+            except OSError:
+                pass
+        mode = stat.S_IMODE(dst.stat().st_mode) if dst.exists() else 0o644
+        fd, tmp_name = tempfile.mkstemp(prefix=".jev-vendored-", dir=str(dst.parent))
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp_name, mode)
+            os.replace(tmp_name, dst)
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+        changed = True
+    return changed
+
+
 def patch_router_text(text: str) -> tuple[str, bool]:
     """Return (patched_text, changed), rejecting unfamiliar upstream shapes."""
     if EXACT_PROBE_DECLARATION not in text:
@@ -430,8 +621,26 @@ def patch_router_text(text: str) -> tuple[str, bool]:
         text, ROUTER_CALLSITE_ORIGINAL, ROUTER_CALLSITE_PATCHED)
     changed = changed or sub_changed
 
+    # Session registry + stealth forward integration (router.mjs). Order matters:
+    # imports (N1), the outer flag (N2), start calls (N3), the native-branch
+    # wrapper open/close (N4a/N4b), the fetch switch (N5), and the SSE observe
+    # hook (N6). Each is idempotent via its patched form and fail-closed.
+    for original, patched in (
+        (S_N1_ORIGINAL, S_N1_PATCHED),
+        (S_N2_ORIGINAL, S_N2_PATCHED),
+        (S_N3_ORIGINAL, S_N3_PATCHED),
+        (S_N4A_ORIGINAL, S_N4A_PATCHED),
+        (S_N4B_ORIGINAL, S_N4B_PATCHED),
+        (S_N5_ORIGINAL, S_N5_PATCHED),
+        (S_N6_ORIGINAL, S_N6_PATCHED),
+    ):
+        text, hook_changed = _apply_plain_hook(text, original, patched)
+        changed = changed or hook_changed
+
     if not source_supports_exact_native_route(text):
         raise PatchError("Patched Codex Router source did not pass verification.")
+    if not source_supports_session_stealth(text):
+        raise PatchError("Session/stealth integration did not pass verification.")
     return text, changed
 
 
@@ -597,12 +806,13 @@ def restart_router(router_dir: Path, state_dir: Path) -> None:
 
 
 def ensure_patch(router_dir: Path, state_dir: Path, restart: bool) -> dict:
+    modules_changed = write_vendored_modules(router_dir)
     router_path, changed = patch_router_file(router_dir)
     _, fwd_changed = patch_additional_router_file(
         router_dir, FORWARDER_REL, FORWARDER_ORIGINAL, FORWARDER_PATCHED, SUBAGENT_TAG)
     _, cfg_changed = patch_additional_router_file(
         router_dir, LITELLM_CFG_REL, LITELLM_CFG_ORIGINAL, LITELLM_CFG_PATCHED, SUBAGENT_TAG)
-    changed = changed or fwd_changed or cfg_changed
+    changed = changed or fwd_changed or cfg_changed or modules_changed
     sha256 = source_sha256(router_path)
     armed = marker_matches(state_dir, router_path, sha256)
     restarted = False
@@ -624,6 +834,8 @@ def ensure_patch(router_dir: Path, state_dir: Path, restart: bool) -> dict:
         "router_sha256": sha256,
         "exact_native_route": armed,
         "subagent_passthrough": source_supports_subagent_passthrough(router_dir),
+        "session_stealth": source_supports_session_stealth(
+            router_path.read_text(encoding="utf-8")),
     }
 
 
