@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
 
 
 PATCHED_CONDITION = "if (!registeredRoute && requestedModel && !exactRouteProbe) {"
@@ -793,16 +794,36 @@ def restart_router(router_dir: Path, state_dir: Path) -> None:
     # start Node: it recreates a fresh router.log.
     subprocess.run([node, str(service), "stop"], cwd=str(router_dir), check=False,
                    creationflags=(0x08000000 if os.name == "nt" else 0))
-    time.sleep(1.5)
+    # A fixed post-stop sleep was racy: a start issued while the previous
+    # instance still holds the port/service lock returned status 1 even though
+    # an identical start a couple seconds later succeeded. Settle, archive the
+    # log, then retry start with backoff and finally confirm via /health.
+    time.sleep(2.0)
     _archive_router_log(state_dir)
-    result = subprocess.run(
-        [node, str(service), "start"],
-        cwd=str(router_dir),
-        check=False,
-        creationflags=(0x08000000 if os.name == "nt" else 0),
-    )
-    if result.returncode != 0:
-        raise PatchError(f"Codex Router service start failed with status {result.returncode}.")
+    last_status = 1
+    for attempt in range(4):
+        if attempt > 0:
+            time.sleep(2.5)
+        started = subprocess.run(
+            [node, str(service), "start"],
+            cwd=str(router_dir),
+            check=False,
+            creationflags=(0x08000000 if os.name == "nt" else 0),
+        )
+        last_status = started.returncode
+        # 0 = healthy; 75 = installed but still cold-starting (EX_TEMPFAIL).
+        if last_status in (0, 75):
+            break
+    if last_status in (0, 75):
+        for _ in range(30):
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:4202/health", timeout=3) as resp:
+                    if resp.status == 200:
+                        return
+            except OSError:
+                time.sleep(1.0)
+    raise PatchError(
+        f"Codex Router service start failed with status {last_status}.")
 
 
 def ensure_patch(router_dir: Path, state_dir: Path, restart: bool) -> dict:
