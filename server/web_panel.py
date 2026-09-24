@@ -220,6 +220,7 @@ PANEL_HTML = r'''<!DOCTYPE html>
     <button class="navbtn" data-page="decision"><span class="ic">🧠</span><span data-i18n="nav.decision">Decision</span></button>
     <button class="navbtn" data-page="models"><span class="ic">📦</span><span data-i18n="nav.models">Work Models</span></button>
     <button class="navbtn" data-page="activity"><span class="ic">📡</span><span data-i18n="nav.activity">Live Activity</span></button>
+    <button class="navbtn" data-page="sessions"><span class="ic">💬</span><span data-i18n="nav.sessions">Sessions</span></button>
     <button class="navbtn" data-page="keys"><span class="ic">🔑</span><span data-i18n="nav.keys">Keys</span></button>
     <div class="sidefoot"><div class="health"><span class="dotd" id="healthDot"></span><span id="healthText" data-i18n="healthy">service healthy</span></div></div>
   </aside>
@@ -332,6 +333,25 @@ PANEL_HTML = r'''<!DOCTYPE html>
       </div>
     </section>
 
+    <!-- SESSIONS -->
+    <section class="page" id="page-sessions">
+      <div class="card full">
+        <h2 data-i18n="se.title">Sessions</h2>
+        <p class="muted" style="font-size:12px;margin:-2px 0 12px;" data-i18n="se.hint"></p>
+        <table>
+          <thead><tr>
+            <th data-i18n="se.session">Session</th>
+            <th data-i18n="se.requested">Requested</th>
+            <th data-i18n="se.served">Actual served</th>
+            <th data-i18n="se.state">State</th>
+            <th data-i18n="se.requests">Requests</th>
+            <th data-i18n="se.last">Last active</th>
+          </tr></thead>
+          <tbody id="seBody"></tbody>
+        </table>
+      </div>
+    </section>
+
     <!-- KEYS -->
     <section class="page" id="page-keys">
       <div class="card full">
@@ -379,7 +399,12 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "ks.provider":"provider","ks.value":"Paste key","ks.save":"Save","ks.note":"Keys are stored locally and never logged.",
     "ks.configured":"configured","ks.missing":"missing","ks.saved":"Saved.","flight":"Routing in flight; retry shortly.",
     "busy":"Working…","page.overview":"Overview","page.decision":"Decision","page.models":"Work Models",
-    "page.activity":"Live Activity","page.keys":"Keys"},
+    "page.activity":"Live Activity","page.keys":"Keys",
+    "nav.sessions":"Sessions","page.sessions":"Sessions",
+    "se.title":"Sessions","se.hint":"Requested model vs the model the upstream actually served. A red chip marks a mismatch.",
+    "se.session":"Session","se.requested":"Requested","se.served":"Actual served","se.state":"State",
+    "se.requests":"Requests","se.last":"Last active","se.match":"Consistent","se.mismatch":"Mismatch",
+    "se.active":"active","se.none":"No sessions yet."},
   zh:{"brand":"自动 Codex 路由","brandSub":"会话感知运行时","nav.overview":"总览",
     "nav.decision":"决策层","nav.models":"模型名单","nav.activity":"实时活动","nav.keys":"密钥",
     "healthy":"服务正常","ov.auto":"自动路由","ov.current":"当前路由","ov.model":"模型",
@@ -404,7 +429,12 @@ PANEL_HTML = r'''<!DOCTYPE html>
     "ks.provider":"供应商","ks.value":"粘贴密钥","ks.save":"保存","ks.note":"密钥仅保存在本地，不会被记录。",
     "ks.configured":"已配置","ks.missing":"未配置","ks.saved":"已保存。","flight":"有路由请求进行中，请稍后再试。",
     "busy":"处理中…","page.overview":"总览","page.decision":"决策层","page.models":"干活模型",
-    "page.activity":"实时活动","page.keys":"密钥"}
+    "page.activity":"实时活动","page.keys":"密钥",
+    "nav.sessions":"会话","page.sessions":"会话",
+    "se.title":"会话","se.hint":"请求的模型 vs 上游实际服务的模型；红色标记表示出现不一致。",
+    "se.session":"会话","se.requested":"请求模型","se.served":"实际模型","se.state":"状态",
+    "se.requests":"请求数","se.last":"最后活跃","se.match":"一致","se.mismatch":"不一致",
+    "se.active":"活跃","se.none":"暂无会话。"}
   };
   var lang=(navigator.language||"en").toLowerCase().indexOf("zh")===0?"zh":"en";
   var catalog=null,status=null,busy=false,recentRows=null;
@@ -630,6 +660,39 @@ PANEL_HTML = r'''<!DOCTYPE html>
     if(recentRows)safe(function(){renderRecent(recentRows);});
   }
 
+  function relTime(iso){
+    if(!iso)return"—";
+    var s=Math.max(0,Math.round((Date.now()-new Date(iso).getTime())/1000));
+    if(s<60)return s+"s";
+    var m=Math.floor(s/60); if(m<60)return m+"m";
+    var h=Math.floor(m/60); if(h<24)return h+"h";
+    return Math.floor(h/24)+"d";
+  }
+  function renderSessions(d){
+    var body=$("seBody"); var list=(d&&d.sessions)||[];
+    if(!list.length){body.innerHTML='<tr><td colspan="6" style="color:#8a8f98;">'+esc(t("se.none"))+'</td></tr>';return;}
+    var rows="";
+    list.forEach(function(s){
+      var requested=s.requested||"—", served=s.served||"—";
+      var mismatch=s.served&&s.requested&&s.served!==s.requested;
+      var chip;
+      if(!s.served){chip='<span style="background:#e9edf3;color:#6a7078;border-radius:999px;padding:2px 9px;font-size:11px;font-weight:600;">'+esc(t("se.active"))+'</span>';}
+      else if(mismatch){chip='<span title="'+esc((s.mismatches&&s.mismatches[0]&&s.mismatches[0].at)||"")+'" style="background:#fde4e4;color:#d24b4b;border-radius:999px;padding:2px 9px;font-size:11px;font-weight:600;">'+esc(t("se.mismatch"))+'</span>';}
+      else{chip='<span style="background:#e3f4ea;color:#248a54;border-radius:999px;padding:2px 9px;font-size:11px;font-weight:600;">'+esc(t("se.match"))+'</span>';}
+      var servedCell=esc(shortModel(served));
+      if(mismatch&&s.mismatches&&s.mismatches[0]){servedCell+='<div style="font-size:10px;color:#d24b4b;">'+esc(relTime(s.mismatches[0].at))+'</div>';}
+      var sid=esc(String(s.id).slice(0,12));
+      rows+='<tr'+(s.active?' style="background:#f6f8fb;"':"")+'>'
+        +'<td class="mono" title="'+esc(s.id)+'">'+sid+'</td>'
+        +'<td class="mono">'+esc(shortModel(requested))+'</td>'
+        +'<td class="mono">'+servedCell+'</td>'
+        +'<td>'+chip+'</td>'
+        +'<td>'+esc(s.requests||0)+'</td>'
+        +'<td>'+esc(relTime(s.lastAt))+'</td></tr>';
+    });
+    body.innerHTML=rows;
+  }
+
   function refresh(){
     fetch("/control/status").then(function(r){return r.json();})
       .then(renderStatus).catch(function(){});
@@ -637,6 +700,8 @@ PANEL_HTML = r'''<!DOCTYPE html>
       .then(renderCatalog).catch(function(){});
     fetch("/control/recent").then(function(r){return r.json();})
       .then(function(d){renderRecent(d.records||[]);}).catch(function(){});
+    fetch("/control/sessions").then(function(r){return r.json();})
+      .then(renderSessions).catch(function(){});
   }
 
   $("autoSwitch").addEventListener("change",function(ev){

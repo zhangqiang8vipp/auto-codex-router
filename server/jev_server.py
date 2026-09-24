@@ -1721,6 +1721,18 @@ class Handler(BaseHTTPRequestHandler):
         snapshot["today"] = COUNTERS.today()
         return snapshot
 
+    def _sessions(self):
+        spath = os.path.join(STATE, "sessions.json")
+        try:
+            with open(spath, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            data = {"version": 1, "sessions": []}
+        if not isinstance(data, dict):
+            data = {"version": 1, "sessions": []}
+        data["ok"] = True
+        return data
+
     def _auto_control(self):
         length = int(self.headers.get("Content-Length") or 0)
         if length > CONTROL_MAX_BYTES:
@@ -1858,6 +1870,8 @@ class Handler(BaseHTTPRequestHandler):
             })
         elif path in ("/control/status", "/v1/control/status"):
             self._json(200, self._auto_status())
+        elif path in ("/control/sessions", "/v1/control/sessions"):
+            self._json(200, self._sessions())
         elif path in web_panel.RECENT_PATHS:
             self._json(200, {"records": web_panel.recent_records(LOG_PATH)})
         elif path in ("/control/catalog", "/v1/control/catalog"):
