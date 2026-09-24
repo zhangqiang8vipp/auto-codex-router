@@ -97,6 +97,10 @@ foreach ($required in @($runService, $runReport, $server)) {
     throw "Required file not found: $required"
   }
 }
+$hiddenLauncher = Join-Path $RepoRoot "server\run-service-hidden.vbs"
+if (-not (Test-Path -LiteralPath $hiddenLauncher -PathType Leaf)) {
+  throw "Required file not found: $hiddenLauncher"
+}
 
 if ([string]::IsNullOrWhiteSpace($StateDir)) {
   $StateDir = if ($env:CODEX_ROUTER_STATE_DIR) {
@@ -170,7 +174,8 @@ try {
 }
 
 $powerShell = (Get-Command powershell.exe -ErrorAction Stop).Source
-$serviceArgs = @(
+$wscript = Join-Path $env:WINDIR "System32\wscript.exe"
+$servicePowerShellArgs = @(
   "-NoProfile",
   "-WindowStyle", "Hidden",
   "-ExecutionPolicy", "Bypass",
@@ -181,13 +186,20 @@ $serviceArgs = @(
   "-RouterDir", ('"{0}"' -f $RouterDir)
 ) -join " "
 
-$serviceAction = New-ScheduledTaskAction -Execute $powerShell -Argument $serviceArgs
+$hiddenLauncherArgs = @(
+  "//B",
+  "//NoLogo",
+  ('"{0}"' -f $hiddenLauncher),
+  ('"{0}"' -f $powerShell),
+  $servicePowerShellArgs
+) -join " "
+$serviceAction = New-ScheduledTaskAction -Execute $wscript -Argument $hiddenLauncherArgs
 $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $logon = New-ScheduledTaskTrigger -AtLogOn -User $currentUser
 $heartbeatParams = @{
   Once = $true
-  At = (Get-Date).AddMinutes(5)
-  RepetitionInterval = (New-TimeSpan -Minutes 5)
+  At = (Get-Date).AddMinutes(15)
+  RepetitionInterval = (New-TimeSpan -Minutes 15)
   RepetitionDuration = (New-TimeSpan -Days 3650)
 }
 $heartbeat = New-ScheduledTaskTrigger @heartbeatParams
