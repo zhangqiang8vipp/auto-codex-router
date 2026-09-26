@@ -45,8 +45,11 @@ class SessionIdentity(unittest.TestCase):
         self.assertNotIn("thread-123", a)
 
     def test_environment_cwd_is_read_locally(self):
-        payload = {"input": [self.user("<environment_context><cwd>/tmp/project</cwd></environment_context>")]}
-        self.assertEqual(smart.extract_cwd(payload), "/tmp/project")
+        with tempfile.TemporaryDirectory() as project:
+            cwd = os.path.realpath(project)
+            envelope = f"<environment_context><cwd>{cwd}</cwd></environment_context>"
+            payload = {"input": [self.user(envelope)]}
+            self.assertEqual(smart.extract_cwd(payload), cwd)
 
 
 class StateEnrichment(unittest.TestCase):

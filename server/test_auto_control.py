@@ -83,12 +83,17 @@ class AutoControl(unittest.TestCase):
             with open(os.path.join(state, control.ROUTER_DIR_STATE_NAME), "w", encoding="utf-8") as fh:
                 fh.write(router + "\n")
             with mock.patch.dict(os.environ, {"CODEX_ROUTER_DIR": "", "LOCALAPPDATA": ""}, clear=False):
-                self.assertEqual(control.resolve_control_script(None, state), script)
+                resolved = control.resolve_control_script(None, state)
+            self.assertEqual(
+                os.path.normcase(os.path.realpath(resolved)),
+                os.path.normcase(os.path.realpath(script)))
 
     def test_missing_router_dir_fails_closed_without_mutating_redirect(self):
         with tempfile.TemporaryDirectory() as state:
             self.write_redirect(state, "native/other")
-            result = control.set_enabled(state, None, True)
+            with mock.patch.object(
+                control, "resolve_control_script", return_value=None):
+                result = control.set_enabled(state, None, True)
             self.assertFalse(result.available)
             self.assertEqual(control.read_redirect_model(state), "native/other")
 
