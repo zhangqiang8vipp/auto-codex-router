@@ -22,6 +22,25 @@ ROUTER_HEADERS_FIXTURE = (
     "}\n"
 )
 
+# Pristine anchors for the session-registry + stealth hooks (N1..N6). Kept by
+# reference to the patcher constants so the fixture tracks them automatically.
+SESSION_STEALTH_FIXTURE = (
+    patcher.S_N1_ORIGINAL
+    + patcher.S_N2_ORIGINAL
+    + patcher.S_N3_ORIGINAL
+    + patcher.S_N4A_ORIGINAL
+    + patcher.S_N4B_ORIGINAL
+    + patcher.S_N5_ORIGINAL
+    + patcher.S_N6_ORIGINAL
+)
+
+
+def prewrite_vendored_modules(root):
+    """Pre-populate the vendored Node modules so a re-run reports no change."""
+    src = root / "src"
+    for name in patcher.VENDORED_MODULES:
+        (src / name).write_bytes((patcher.VENDOR_DIR / name).read_bytes())
+
 
 def write_additional_source_files(root):
     """Create api-forwarder.mjs and litellm-config.mjs with original anchors."""
@@ -93,6 +112,7 @@ def upstream_fixture(condition, include_quota_anchor=True):
         "}\n"
         + normalize_fn
         + ROUTER_HEADERS_FIXTURE
+        + SESSION_STEALTH_FIXTURE
     )
 
 
@@ -233,6 +253,9 @@ class CodexRouterExactRoutePatch(unittest.TestCase):
                 encoding="utf-8",
             )
             write_patched_additional_source_files(root)
+            # Vendored modules already present -> the only reason to act is the
+            # unarmed prepatched source, so changed must stay False.
+            prewrite_vendored_modules(root)
             state = root / "state"
             with mock.patch.object(patcher, "restart_router") as restart:
                 result = patcher.ensure_patch(root, state, restart=True)
