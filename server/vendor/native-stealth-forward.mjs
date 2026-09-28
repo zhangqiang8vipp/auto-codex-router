@@ -10,10 +10,19 @@
 //   - writes the exact original (already zstd) body bytes;
 //   - wraps the h2 response in a standard web Response so the existing
 //     pipeResponse pipeline is reused unchanged.
-// The TLS ClientHello is still Node's (that last fingerprint cannot change
-// without a different TLS stack), but every header/body/ALPN discrepancy the
-// earlier capture found is removed.
+//
+// Egress: a direct TLS socket is tried first (best case: TUN/transparent VPN
+// or direct network). If direct fails fast (DNS poisoning / connect timeout,
+// which is what happens when the VPN is "system proxy only"), the same TLS+h2
+// connection is tunneled through the local HTTP proxy with CONNECT. Nothing
+// about the wire changes: SNI is still chatgpt.com, ALPN is still h2, headers
+// and body are byte-identical; only the local TCP leg goes via the proxy.
+// The TLS ClientHello is still Node's either way (that last fingerprint cannot
+// change without a different TLS stack).
 import http2 from "node:http2";
+import net from "node:net";
+import tls from "node:tls";
+import { execFileSync } from "node:child_process";
 
 // Hop-by-hop / h1 transport headers that must never travel over h2. Host is
 // replaced by :authority; content-length is the one transport header h2 still
@@ -47,15 +56,258 @@ function replayHeaders(req) {
   return out;
 }
 
+/* ----------------------- local proxy discovery ----------------------- */
+
+const DIRECT_PROBE_TIMEOUT_MS = 5000;
+const PROXY_HOLD_MS = 5 * 60 * 1000; // prefer a working proxy for 5 min
+const DIRECT_HOLD_MS = 60 * 1000;
+
+function normalizeProxy(value) {
+  if (!value) return null;
+  let v = String(value).trim();
+  if (!v) return null;
+  if (!/^\w+:\/\//.test(v)) v = `http://${v}`;
+  let u;
+  try {
+    u = new URL(v);
+  } catch {
+    return null;
+  }
+  // Only HTTP proxies (which support CONNECT) are handled. SOCKS needs a
+  // separate client and is intentionally not silently rewritten.
+  if (u.protocol !== "http:" || !u.hostname) return null;
+  if (!u.port) u.port = "80";
+  return u;
+}
+
+export function proxyFromEnv(env = process.env) {
+  for (const key of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"]) {
+    const u = normalizeProxy(env[key]);
+    if (u) return u;
+  }
+  return null;
+}
+
+// WinINET ProxyServer can be "host:port", "host:port;", or a per-protocol map:
+// "http=host:port;https=host:port;".
+export function parseWinInetProxyServer(raw) {
+  if (!raw) return null;
+  const generic = [];
+  const map = {};
+  for (const token of String(raw).split(";")) {
+    const t = token.trim();
+    if (!t) continue;
+    const eq = t.indexOf("=");
+    if (eq === -1) {
+      if (generic.length === 0) generic.push(t);
+    } else {
+      map[t.slice(0, eq).trim().toLowerCase()] = t.slice(eq + 1).trim();
+    }
+  }
+  return normalizeProxy(map.https || map.http || generic[0]);
+}
+
+export function wininetProxy() {
+  if (process.platform !== "win32") return null;
+  try {
+    const out = execFileSync(
+      "reg",
+      ["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings"],
+      { encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "ignore"] },
+    );
+    let enabled = false;
+    let server = null;
+    for (const line of out.split(/\r?\n/)) {
+      const m = line.match(/^\s*([A-Za-z]+)\s+REG_\w+\s+(.*)$/);
+      if (!m) continue;
+      if (m[1] === "ProxyEnable") enabled = m[2].trim() === "0x1";
+      if (m[1] === "ProxyServer") server = m[2].trim();
+    }
+    return enabled ? parseWinInetProxyServer(server) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function detectProxy() {
+  return proxyFromEnv() || wininetProxy() || null;
+}
+
+/* ----------------------- socket establishment ------------------------ */
+
+function tlsOver(socket, host, { timeoutMs = DIRECT_PROBE_TIMEOUT_MS } = {}) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, v) => {
+      if (settled) return;
+      settled = true;
+      fn(v);
+    };
+    const tlsSock = tls.connect({ socket, servername: host, ALPNProtocols: ["h2"] });
+    tlsSock.setTimeout(timeoutMs);
+    tlsSock.on("secureConnect", () => {
+      if (!tlsSock.authorized) {
+        tlsSock.destroy();
+        return finish(reject, tlsSock.authorizationError || new Error("TLS not authorized"));
+      }
+      finish(resolve, tlsSock);
+    });
+    tlsSock.on("error", (e) => finish(reject, e));
+    tlsSock.on("timeout", () => finish(reject, new Error("TLS handshake timeout")));
+  });
+}
+
+function connectDirect(host, port, { timeoutMs = DIRECT_PROBE_TIMEOUT_MS, signal } = {}) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, v) => {
+      if (settled) return;
+      settled = true;
+      fn(v);
+    };
+    const sock = tls.connect({ host, port, servername: host, ALPNProtocols: ["h2"] });
+    sock.setTimeout(timeoutMs);
+    sock.on("secureConnect", () => {
+      if (!sock.authorized) {
+        sock.destroy();
+        return finish(reject, sock.authorizationError || new Error("TLS not authorized"));
+      }
+      finish(resolve, sock);
+    });
+    sock.on("error", (e) => finish(reject, e));
+    sock.on("timeout", () => {
+      sock.destroy();
+      finish(reject, new Error("direct connect timeout"));
+    });
+    if (signal) {
+      if (signal.aborted) return finish(reject, new Error("aborted"));
+      signal.addEventListener(
+        "abort",
+        () => {
+          sock.destroy();
+          finish(reject, new Error("aborted"));
+        },
+        { once: true },
+      );
+    }
+  });
+}
+
+export function connectViaProxy(proxy, host, port, { timeoutMs = DIRECT_PROBE_TIMEOUT_MS, signal } = {}) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (fn, v) => {
+      if (settled) return;
+      settled = true;
+      fn(v);
+    };
+    const raw = net.connect({ host: proxy.hostname, port: Number(proxy.port) });
+    raw.setTimeout(timeoutMs);
+    raw.on("error", (e) => {
+      raw.destroy();
+      finish(reject, e);
+    });
+    raw.on("timeout", () => {
+      raw.destroy();
+      finish(reject, new Error("proxy connect timeout"));
+    });
+    if (signal) {
+      if (signal.aborted) return finish(reject, new Error("aborted"));
+      signal.addEventListener(
+        "abort",
+        () => {
+          raw.destroy();
+          finish(reject, new Error("aborted"));
+        },
+        { once: true },
+      );
+    }
+    raw.on("connect", () => {
+      let req = `CONNECT ${host}:${port} HTTP/1.1\r\nHost: ${host}:${port}\r\n`;
+      if (proxy.username || proxy.password) {
+        const token = Buffer.from(
+          `${decodeURIComponent(proxy.username)}:${decodeURIComponent(proxy.password)}`,
+        ).toString("base64");
+        req += `Proxy-Authorization: Basic ${token}\r\n`;
+      }
+      req += "\r\n";
+      raw.write(req);
+
+      let buf = Buffer.alloc(0);
+      const onData = (chunk) => {
+        buf = Buffer.concat([buf, chunk]);
+        const idx = buf.indexOf("\r\n\r\n");
+        if (idx === -1) {
+          if (buf.length > 8192) {
+            raw.destroy();
+            finish(reject, new Error("proxy CONNECT response too large"));
+          }
+          return;
+        }
+        raw.removeListener("data", onData);
+        const statusLine = buf.slice(0, idx).toString("utf8").split("\r\n")[0];
+        const m = statusLine.match(/HTTP\/1\.[01]\s+(\d{3})/);
+        if (!m || Number(m[1]) < 200 || Number(m[1]) >= 300) {
+          raw.destroy();
+          return finish(reject, new Error(`proxy CONNECT failed: ${statusLine}`));
+        }
+        raw.setTimeout(0);
+        tlsOver(raw, host, { timeoutMs }).then(
+          (v) => finish(resolve, v),
+          (e) => finish(reject, e),
+        );
+      };
+      raw.on("data", onData);
+    });
+  });
+}
+
+// Remember which egress last worked so a poisoned-direct path doesn't cost a
+// multi-second timeout on every single request.
+let egress = { mode: null, until: 0 };
+
+export async function establishSocket(host, port, { signal } = {}) {
+  const now = Date.now();
+  if (egress.mode === "proxy" && now < egress.until) {
+    const proxy = detectProxy();
+    if (proxy) {
+      try {
+        return await connectViaProxy(proxy, host, port, { signal });
+      } catch {
+        egress = { mode: null, until: 0 }; // proxy regressed; re-probe direct
+      }
+    } else {
+      egress = { mode: null, until: 0 };
+    }
+  }
+
+  try {
+    const sock = await connectDirect(host, port, { signal });
+    egress = { mode: "direct", until: Date.now() + DIRECT_HOLD_MS };
+    return sock;
+  } catch (directErr) {
+    const proxy = detectProxy();
+    if (!proxy) throw directErr;
+    const sock = await connectViaProxy(proxy, host, port, { signal });
+    egress = { mode: "proxy", until: Date.now() + PROXY_HOLD_MS };
+    return sock;
+  }
+}
+
+/* ----------------------------- h2 session ---------------------------- */
+
 // One keep-alive h2 session per origin, recreated on close/goaway/error.
 const sessions = new Map();
-function getSession(origin, { signal } = {}) {
+async function getSession(origin, { signal } = {}) {
   const cached = sessions.get(origin);
   if (cached && !cached.closed && !cached.destroyed) return cached.session;
 
+  const host = new URL(origin).hostname;
+  const socket = await establishSocket(host, 443, { signal });
   const session = http2.connect(origin, {
     ALPNProtocols: ["h2"],
-    servername: new URL(origin).hostname,
+    servername: host,
+    createConnection: () => socket,
   });
   const entry = { session, closed: false };
   const onGone = () => {
@@ -77,7 +329,7 @@ function getSession(origin, { signal } = {}) {
 export async function forwardStealthNative(targetUrl, req, rawBody, { signal } = {}) {
   const url = new URL(targetUrl);
   const origin = url.origin;
-  const session = getSession(origin, { signal });
+  const session = await getSession(origin, { signal });
 
   const headers = replayHeaders(req);
   headers[http2.constants.HTTP2_HEADER_METHOD] = http2.constants.HTTP2_METHOD_POST;
@@ -109,10 +361,18 @@ export async function forwardStealthNative(targetUrl, req, rawBody, { signal } =
     start(controller) {
       enqueue = (c) => controller.enqueue(c);
       closeStream = () => {
-        try { controller.close(); } catch { /* already closed */ }
+        try {
+          controller.close();
+        } catch {
+          /* already closed */
+        }
       };
       fail = (e) => {
-        try { controller.error(e); } catch { /* already closed */ }
+        try {
+          controller.error(e);
+        } catch {
+          /* already closed */
+        }
       };
     },
   });
