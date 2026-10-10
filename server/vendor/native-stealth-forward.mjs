@@ -129,6 +129,10 @@ export function wininetProxy() {
   }
 }
 
+// Alias kept for start.mjs, which imports the WinINET reader under this name.
+// Returns a URL (with .href) for the current Windows system proxy, or null.
+export const readWininetProxy = wininetProxy;
+
 export function detectProxy() {
   return proxyFromEnv() || wininetProxy() || null;
 }
@@ -150,6 +154,10 @@ function tlsOver(socket, host, { timeoutMs = DIRECT_PROBE_TIMEOUT_MS } = {}) {
         tlsSock.destroy();
         return finish(reject, tlsSock.authorizationError || new Error("TLS not authorized"));
       }
+      // Same reasoning as connectDirect: the deadline bounds the handshake, not
+      // the connection's lifetime. (This path never destroyed on timeout, so it
+      // was already harmless -- cleared here so both egresses behave alike.)
+      tlsSock.setTimeout(0);
       finish(resolve, tlsSock);
     });
     tlsSock.on("error", (e) => finish(reject, e));
@@ -172,10 +180,17 @@ function connectDirect(host, port, { timeoutMs = DIRECT_PROBE_TIMEOUT_MS, signal
         sock.destroy();
         return finish(reject, sock.authorizationError || new Error("TLS not authorized"));
       }
+      // The deadline bounds the CONNECT, not the connection's lifetime. Leaving
+      // it armed turned every >5s gap in the response stream -- exactly the
+      // model's prefill between the response headers and the first token -- into
+      // a destroy() of a live, healthy session, which surfaced as
+      // "stream disconnected before completion".
+      sock.setTimeout(0);
       finish(resolve, sock);
     });
     sock.on("error", (e) => finish(reject, e));
     sock.on("timeout", () => {
+      if (settled) return;
       sock.destroy();
       finish(reject, new Error("direct connect timeout"));
     });
@@ -326,9 +341,38 @@ async function getSession(origin, { signal } = {}) {
   return session;
 }
 
-export async function forwardStealthNative(targetUrl, req, rawBody, { signal } = {}) {
-  const url = new URL(targetUrl);
-  const origin = url.origin;
+// A stream that dies before its response headers is indistinguishable from a
+// half-dead keep-alive session: the socket never emitted goaway/close, so the
+// cached entry above still looks usable and the next attempt would fail the
+// same way. Drop it so the retry below dials a fresh connection.
+function dropSession(origin) {
+  const entry = sessions.get(origin);
+  if (!entry) return;
+  sessions.delete(origin);
+  try {
+    entry.session.destroy();
+  } catch {
+    /* already gone */
+  }
+}
+
+// Only failures raised before the response headers can be replayed: the request
+// body is a fully materialized Buffer and nothing has been relayed downstream
+// yet. Anything after the headers belongs to the live body stream and must
+// propagate unchanged, so only the two pre-header paths below are tagged.
+function tagPreHeaderFailure(error) {
+  const tagged = error instanceof Error ? error : new Error(String(error));
+  tagged.retryableStealth = true;
+  return tagged;
+}
+
+// Bounded retry for the pre-header failures above. Every attempt replays the
+// identical headers and body, so a retry cannot change what leaves the machine
+// -- it only gives a dead session another connection.
+const STEALTH_MAX_ATTEMPTS = 3;
+const STEALTH_RETRY_BACKOFF_MS = [200, 600];
+
+async function forwardStealthOnce(origin, url, req, rawBody, { signal } = {}) {
   const session = await getSession(origin, { signal });
 
   const headers = replayHeaders(req);
@@ -350,9 +394,11 @@ export async function forwardStealthNative(targetUrl, req, rawBody, { signal } =
       responseHeaders = h;
       resolve();
     });
-    stream.on("error", reject);
+    stream.on("error", (error) => reject(tagPreHeaderFailure(error)));
     stream.on("close", () => {
-      if (!responseHeaders) reject(new Error("stealth h2 stream closed before response"));
+      if (!responseHeaders) {
+        reject(tagPreHeaderFailure(new Error("stealth h2 stream closed before response")));
+      }
     });
   });
 
@@ -394,4 +440,32 @@ export async function forwardStealthNative(targetUrl, req, rawBody, { signal } =
   }
   const status = Number(responseHeaders[http2.constants.HTTP2_HEADER_STATUS]) || 502;
   return new Response(bodyStream, { status, headers: out });
+}
+
+export async function forwardStealthNative(targetUrl, req, rawBody, { signal } = {}) {
+  const url = new URL(targetUrl);
+  const origin = url.origin;
+  let lastError;
+
+  for (let attempt = 1; attempt <= STEALTH_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return await forwardStealthOnce(origin, url, req, rawBody, { signal });
+    } catch (error) {
+      lastError = error;
+      // A response body that already started streaming, an aborted request, or
+      // a failure while dialing is not ours to replay: only the tagged
+      // pre-header failures are.
+      if (error?.retryableStealth !== true || signal?.aborted) throw error;
+      if (attempt === STEALTH_MAX_ATTEMPTS) break;
+      dropSession(origin);
+      const delay =
+        STEALTH_RETRY_BACKOFF_MS[Math.min(attempt - 1, STEALTH_RETRY_BACKOFF_MS.length - 1)];
+      process.stderr.write(
+        `[codex-router] stealth retry ${attempt}/${STEALTH_MAX_ATTEMPTS} after: ${error.message}\n`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+
+  throw lastError;
 }
