@@ -356,6 +356,24 @@ function dropSession(origin) {
   }
 }
 
+// Forget the cached egress preference and tear down every pooled h2 session.
+// Called when the Windows system proxy changes (see fetch-transport watcher):
+// the held proxy/direct choice and any socket dialed through the old proxy
+// must not be reused, so the next request re-probes and connects fresh.
+export function drainStealthSessions() {
+  egress = { mode: null, until: 0 };
+  const entries = Array.from(sessions.values());
+  sessions.clear();
+  for (const entry of entries) {
+    entry.closed = true;
+    try {
+      entry.session.destroy();
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
 // Only failures raised before the response headers can be replayed: the request
 // body is a fully materialized Buffer and nothing has been relayed downstream
 // yet. Anything after the headers belongs to the live body stream and must
