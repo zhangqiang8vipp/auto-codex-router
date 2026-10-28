@@ -58,7 +58,12 @@ function replayHeaders(req) {
 
 /* ----------------------- local proxy discovery ----------------------- */
 
-const DIRECT_PROBE_TIMEOUT_MS = 5000;
+// Direct dialing must fail fast: when TUN is off the DNS is poisoned and the
+// connect hangs, and every egress-cache expiry pays this probe once. 5s made
+// each network switch cost a visible stall; 2s keeps the same direct-first
+// semantics while cutting that penalty. On failure the proxy path still takes
+// over and is held for PROXY_HOLD_MS.
+const DIRECT_PROBE_TIMEOUT_MS = 2000;
 const PROXY_HOLD_MS = 5 * 60 * 1000; // prefer a working proxy for 5 min
 const DIRECT_HOLD_MS = 60 * 1000;
 
@@ -315,7 +320,7 @@ export async function establishSocket(host, port, { signal } = {}) {
 const sessions = new Map();
 async function getSession(origin, { signal } = {}) {
   const cached = sessions.get(origin);
-  if (cached && !cached.closed && !cached.destroyed) return cached.session;
+  if (cached && !cached.closed && !cached.destroyed) return cached;
 
   const host = new URL(origin).hostname;
   const socket = await establishSocket(host, 443, { signal });
@@ -324,7 +329,7 @@ async function getSession(origin, { signal } = {}) {
     servername: host,
     createConnection: () => socket,
   });
-  const entry = { session, closed: false };
+  const entry = { session, closed: false, activeStreams: 0 };
   const onGone = () => {
     entry.closed = true;
     if (sessions.get(origin) === entry) sessions.delete(origin);
@@ -338,7 +343,7 @@ async function getSession(origin, { signal } = {}) {
     if (signal.aborted) session.close();
     else signal.addEventListener("abort", () => session.close(), { once: true });
   }
-  return session;
+  return entry;
 }
 
 // A stream that dies before its response headers is indistinguishable from a
@@ -356,15 +361,20 @@ function dropSession(origin) {
   }
 }
 
-// Forget the cached egress preference and tear down every pooled h2 session.
+// Forget the cached egress preference and tear down pooled h2 sessions.
 // Called when the Windows system proxy changes (see fetch-transport watcher):
 // the held proxy/direct choice and any socket dialed through the old proxy
 // must not be reused, so the next request re-probes and connects fresh.
+// Sessions with a stream mid-generation are left alone: destroying them would
+// cut a live response and make Codex replay the whole turn. Their entries are
+// removed when the stream finishes (forwardStealthOnce), and egress reset
+// above already forces fresh dials for every new request.
 export function drainStealthSessions() {
   egress = { mode: null, until: 0 };
-  const entries = Array.from(sessions.values());
-  sessions.clear();
-  for (const entry of entries) {
+  const entries = Array.from(sessions.entries());
+  for (const [origin, entry] of entries) {
+    if (entry.activeStreams > 0) continue;
+    sessions.delete(origin);
     entry.closed = true;
     try {
       entry.session.destroy();
@@ -391,7 +401,9 @@ const STEALTH_MAX_ATTEMPTS = 3;
 const STEALTH_RETRY_BACKOFF_MS = [200, 600];
 
 async function forwardStealthOnce(origin, url, req, rawBody, { signal } = {}) {
-  const session = await getSession(origin, { signal });
+  const entry = await getSession(origin, { signal });
+  const session = entry.session;
+  entry.activeStreams += 1;
 
   const headers = replayHeaders(req);
   headers[http2.constants.HTTP2_HEADER_METHOD] = http2.constants.HTTP2_METHOD_POST;
@@ -420,29 +432,24 @@ async function forwardStealthOnce(origin, url, req, rawBody, { signal } = {}) {
     });
   });
 
-  let enqueue, closeStream, fail;
+  let enqueue, finishBody;
   const bodyStream = new ReadableStream({
     start(controller) {
-      // A late h2 "data" frame can arrive after "end" already closed the
-      // controller; enqueue would then throw ERR_INVALID_STATE and surface as
-      // an uncaught exception. Guard it the same way close/error are guarded.
+      const closed = () => controller.desiredSize === null;
       enqueue = (c) => {
+        // A late h2 data frame can arrive after the controller already closed;
+        // enqueue would then throw ERR_INVALID_STATE and fault the stream.
+        if (closed()) return;
         try {
           controller.enqueue(c);
-        } catch {
-          /* controller already closed; trailing chunk after end */
-        }
-      };
-      closeStream = () => {
-        try {
-          controller.close();
         } catch {
           /* already closed */
         }
       };
-      fail = (e) => {
+      finishBody = (error) => {
         try {
-          controller.error(e);
+          if (error) controller.error(error);
+          else controller.close();
         } catch {
           /* already closed */
         }
@@ -450,9 +457,25 @@ async function forwardStealthOnce(origin, url, req, rawBody, { signal } = {}) {
     },
   });
 
+  // Exactly one terminal event ends the body. `close` fires on every path --
+  // normal end, RST, goaway, destroy -- so it is the single teardown point;
+  // `end` and `error` are just the fast paths to the same finish. This keeps
+  // the controller's lifecycle aligned with the stream's instead of only
+  // closing on `end` and leaking on abnormal closes.
+  let bodyDone = false;
+  const finish = (error) => {
+    if (bodyDone) return;
+    bodyDone = true;
+    entry.activeStreams -= 1;
+    if (entry.closed && entry.activeStreams === 0 && sessions.get(origin) === entry) {
+      sessions.delete(origin);
+    }
+    finishBody(error);
+  };
   stream.on("data", (chunk) => enqueue(Buffer.from(chunk)));
-  stream.on("end", closeStream);
-  stream.on("error", fail);
+  stream.on("end", () => finish());
+  stream.on("error", (error) => finish(error));
+  stream.on("close", () => finish());
 
   if (rawBody && rawBody.length) stream.write(rawBody);
   stream.end();
