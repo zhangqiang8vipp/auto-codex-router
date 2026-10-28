@@ -423,7 +423,16 @@ async function forwardStealthOnce(origin, url, req, rawBody, { signal } = {}) {
   let enqueue, closeStream, fail;
   const bodyStream = new ReadableStream({
     start(controller) {
-      enqueue = (c) => controller.enqueue(c);
+      // A late h2 "data" frame can arrive after "end" already closed the
+      // controller; enqueue would then throw ERR_INVALID_STATE and surface as
+      // an uncaught exception. Guard it the same way close/error are guarded.
+      enqueue = (c) => {
+        try {
+          controller.enqueue(c);
+        } catch {
+          /* controller already closed; trailing chunk after end */
+        }
+      };
       closeStream = () => {
         try {
           controller.close();
