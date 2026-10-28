@@ -361,23 +361,23 @@ function dropSession(origin) {
   }
 }
 
-// Forget the cached egress preference and tear down pooled h2 sessions.
+// Forget the cached egress preference and retire pooled h2 sessions.
 // Called when the Windows system proxy changes (see fetch-transport watcher):
 // the held proxy/direct choice and any socket dialed through the old proxy
 // must not be reused, so the next request re-probes and connects fresh.
-// Sessions with a stream mid-generation are left alone: destroying them would
-// cut a live response and make Codex replay the whole turn. Their entries are
-// removed when the stream finishes (forwardStealthOnce), and egress reset
-// above already forces fresh dials for every new request.
-export function drainStealthSessions() {
+//
+// Sessions are closed gracefully, not destroyed: `session.close()` sends a
+// GOAWAY and lets in-flight streams finish on their own, so a generation
+// mid-stream is never cut. Entries are removed immediately so the next
+// request dials a fresh connection. The optional `entries` parameter keeps
+// the map injectable for tests.
+export function drainStealthSessions(entries = sessions) {
   egress = { mode: null, until: 0 };
-  const entries = Array.from(sessions.entries());
-  for (const [origin, entry] of entries) {
-    if (entry.activeStreams > 0) continue;
-    sessions.delete(origin);
+  for (const [origin, entry] of Array.from(entries.entries())) {
+    entries.delete(origin);
     entry.closed = true;
     try {
-      entry.session.destroy();
+      if (!entry.session.destroyed) entry.session.close();
     } catch {
       /* already gone */
     }
